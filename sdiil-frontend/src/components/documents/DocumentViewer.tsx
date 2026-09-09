@@ -42,21 +42,30 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
   const isTampered =
     Boolean(doc.flags.tamper_detected) || doc.original_hash !== doc.computed_hash;
 
+  const [isDownloading, setIsDownloading] = useState(false);
+
   const handleDownload = async () => {
     if (!user) return;
-    const blob = await documentsService.downloadDocument(
-      doc.file_id,
-      user.user_id,
-      user.full_name || user.username
-    );
-    const url = window.URL.createObjectURL(blob);
-    const a = window.document.createElement('a');
-    a.href = url;
-    a.download = `${doc.title.replace(/[^a-zA-Z0-9_-]/g, '_')}_v${doc.version}.txt`;
-    window.document.body.appendChild(a);
-    a.click();
-    window.URL.revokeObjectURL(url);
-    window.document.body.removeChild(a);
+    try {
+      setIsDownloading(true);
+      const { filename, blob } = await documentsService.downloadDocument(
+        doc.file_id,
+        user.user_id,
+        user.full_name || user.username
+      );
+      const url = window.URL.createObjectURL(blob);
+      const a = window.document.createElement('a');
+      a.href = url;
+      a.download = filename || `${doc.title.replace(/[^a-zA-Z0-9_-]/g, '_')}_v${doc.version}.pdf`;
+      window.document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      window.document.body.removeChild(a);
+    } catch (err: any) {
+      alert(err?.message || 'Failed to download document');
+    } finally {
+      setIsDownloading(false);
+    }
   };
 
   const handleToggleTamper = async () => {
@@ -83,7 +92,11 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
         </div>
 
         <div className="flex items-center gap-2.5">
-          <TamperBadge status={isTampered ? 'TAMPERED' : 'VERIFIED'} size="md" />
+          <TamperBadge
+            status={isTampered ? 'TAMPERED' : 'VERIFIED'}
+            hash={doc.original_hash || doc.computed_hash}
+            size="md"
+          />
           <SensitivityBadge level={doc.sensitivity_level} size="md" showDetails />
 
           {/* Dev Tamper Toggle */}
@@ -168,10 +181,11 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({
               size="sm"
               variant="secondary"
               disabled={!downloadPerm.allowed}
+              isLoading={isDownloading}
               onClick={handleDownload}
               leftIcon={!downloadPerm.allowed ? <Lock className="w-3.5 h-3.5" /> : <Download className="w-3.5 h-3.5" />}
             >
-              Download
+              Download Evidence
             </Button>
           </Tooltip>
 

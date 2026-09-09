@@ -44,7 +44,11 @@ export const DocumentCard: React.FC<DocumentCardProps> = ({
     >
       {/* Top Bar: Tamper Status (unmissable) & Sensitivity Badge */}
       <div className="flex items-center justify-between gap-2 pb-3 border-b border-border/80">
-        <TamperBadge status={isTampered ? 'TAMPERED' : 'VERIFIED'} size="sm" />
+        <TamperBadge
+          status={isTampered ? 'TAMPERED' : 'VERIFIED'}
+          hash={doc.original_hash || doc.computed_hash}
+          size="sm"
+        />
         <div className="flex items-center gap-1.5">
           <SensitivityBadge level={doc.sensitivity_level} size="sm" />
           {/* Developer/Testing toggle to simulate tamper alert */}

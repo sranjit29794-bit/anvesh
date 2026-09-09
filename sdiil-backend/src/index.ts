@@ -2,6 +2,13 @@ import express, { Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { supabaseAdmin } from './lib/supabaseAdmin.js';
+import { documentsRouter } from './routes/documents.js';
+import { sharingRouter } from './routes/sharing.js';
+import { auditRouter } from './routes/audit.js';
+import { searchRouter } from './routes/search.js';
+import { summaryRouter } from './routes/summary.js';
+import { anomaliesRouter } from './routes/anomalies.js';
+import { adminRouter } from './routes/admin.js';
 
 // Load environment variables
 dotenv.config();
@@ -15,6 +22,15 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json());
+
+// API Routes
+app.use('/api/v1/documents', documentsRouter);
+app.use('/api/v1/sharing', sharingRouter);
+app.use('/api/v1/audit', auditRouter);
+app.use('/api/v1/search', searchRouter);
+app.use('/api/v1/cases', summaryRouter);
+app.use('/api/v1/anomalies', anomaliesRouter);
+app.use('/api/v1/admin', adminRouter);
 
 /**
  * Health check endpoint.

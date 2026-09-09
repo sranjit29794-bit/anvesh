@@ -1,14 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '@/hooks/useAuth';
-import { db } from '@/services/api';
+import { supabase } from '@/services/supabase.client';
 import { sharingService } from '@/services/sharing.service';
+import { documentsService } from '@/services/documents.service';
+import { db } from '@/services/api';
 import { SharingApproval, ConsentReceipt, DocumentRecord } from '@/types/document.types';
 import { ApprovalCard } from '@/components/sharing/ApprovalCard';
 import { ConsentReceiptCard } from '@/components/sharing/ConsentReceiptCard';
 import { ShareModal } from '@/components/sharing/ShareModal';
+import { Modal } from '@/components/ui/Modal';
 import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
-import { Share2, ShieldAlert, FileCheck, Plus } from 'lucide-react';
+import { SensitivityBadge } from '@/components/ui/SensitivityBadge';
+import { Share2, ShieldAlert, FileCheck, Plus, RefreshCw, FileText } from 'lucide-react';
 
 export interface SharingPageProps {
   onSelectDoc?: (docId: string) => void;
@@ -18,16 +22,59 @@ export const Sharing: React.FC<SharingPageProps> = () => {
   const { user } = useAuth();
   const [pendingApprovals, setPendingApprovals] = useState<SharingApproval[]>([]);
   const [receipts, setReceipts] = useState<ConsentReceipt[]>([]);
+  const [availableDocs, setAvailableDocs] = useState<DocumentRecord[]>([]);
   const [selectedDocForShare, setSelectedDocForShare] = useState<DocumentRecord | null>(null);
+  const [isDocPickerOpen, setIsDocPickerOpen] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
 
   const loadData = async () => {
-    const approvals = await sharingService.getPendingApprovals();
-    setPendingApprovals(approvals);
-    setReceipts([...db.receipts]);
+    setIsLoading(true);
+    try {
+      const approvals = await sharingService.getPendingApprovals();
+      setPendingApprovals(approvals);
+
+      const history = await sharingService.getSharingHistory();
+      setReceipts(history);
+
+      // Load documents from assigned cases for sharing
+      if (user?.case_ids && user.case_ids.length > 0) {
+        const docs = await documentsService.getDocumentsByCase(user.case_ids[0]);
+        setAvailableDocs(docs.length > 0 ? docs : db.documents);
+      } else {
+        setAvailableDocs(db.documents);
+      }
+    } catch (err) {
+      console.warn('[SharingPage] Load data notice:', err);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   useEffect(() => {
     loadData();
+
+    // Supabase Realtime channel subscription for instant sync across tabs
+    const channel = supabase
+      .channel('sharing_realtime_channel')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'sharing_events' },
+        () => {
+          loadData();
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'approvals' },
+        () => {
+          loadData();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, [user]);
 
   const handleApprove = async (approvalId: string) => {
@@ -51,6 +98,19 @@ export const Sharing: React.FC<SharingPageProps> = () => {
     await loadData();
   };
 
+  const handleOpenShareInitiator = () => {
+    if (availableDocs.length === 1) {
+      setSelectedDocForShare(availableDocs[0]);
+    } else {
+      setIsDocPickerOpen(true);
+    }
+  };
+
+  const handleSelectDocFromPicker = (doc: DocumentRecord) => {
+    setIsDocPickerOpen(false);
+    setSelectedDocForShare(doc);
+  };
+
   const isSupervisorOrAdmin = user?.role === 'SUPERVISOR' || user?.role === 'ADMIN';
 
   return (
@@ -67,17 +127,28 @@ export const Sharing: React.FC<SharingPageProps> = () => {
           </p>
         </div>
 
-        {/* Quick share button */}
-        {user?.role !== 'COURT_REGISTRAR' && user?.role !== 'REVIEWER' && (
+        <div className="flex items-center gap-2">
           <Button
-            variant="primary"
+            variant="ghost"
             size="sm"
-            onClick={() => setSelectedDocForShare(db.documents[0])}
-            leftIcon={<Plus className="w-4 h-4" />}
+            onClick={loadData}
+            isLoading={isLoading}
+            leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
           >
-            Initiate Document Share
+            Refresh
           </Button>
-        )}
+
+          {user?.role !== 'COURT_REGISTRAR' && user?.role !== 'REVIEWER' && (
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={handleOpenShareInitiator}
+              leftIcon={<Plus className="w-4 h-4" />}
+            >
+              Initiate Document Share
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* Supervisor/Admin Dual-Auth Approval Queue */}
@@ -138,6 +209,38 @@ export const Sharing: React.FC<SharingPageProps> = () => {
           </div>
         )}
       </div>
+
+      {/* Document Selection Modal (when initiating share from Sharing page) */}
+      <Modal
+        isOpen={isDocPickerOpen}
+        onClose={() => setIsDocPickerOpen(false)}
+        title="Select Evidence Document to Share"
+        subtitle="Choose an authorized case document to provision scoped inter-agency access"
+        maxWidth="lg"
+      >
+        <div className="space-y-3 max-h-[60vh] overflow-y-auto">
+          {availableDocs.map((doc) => (
+            <div
+              key={doc.file_id}
+              onClick={() => handleSelectDocFromPicker(doc)}
+              className="flex items-center justify-between p-3 rounded-card bg-bg-secondary border border-border hover:border-accent-primary cursor-pointer transition-colors"
+            >
+              <div className="flex items-center gap-3 min-w-0 pr-2">
+                <div className="w-8 h-8 rounded bg-bg-elevated border border-border flex items-center justify-center text-accent-primary shrink-0">
+                  <FileText className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <h4 className="text-sm font-semibold text-text-primary truncate">{doc.title}</h4>
+                  <div className="text-xs text-text-muted mt-0.5">
+                    Type: {doc.doc_type} • Case: {doc.case_id} • v{doc.version}
+                  </div>
+                </div>
+              </div>
+              <SensitivityBadge level={doc.sensitivity_level} showDetails />
+            </div>
+          ))}
+        </div>
+      </Modal>
 
       {/* Share Modal */}
       {selectedDocForShare && (

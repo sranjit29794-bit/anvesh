@@ -24,18 +24,45 @@ export interface CaseRecord {
   }>;
 }
 
+export interface CaseSummarySection {
+  title: string;
+  content: string;
+  cited_doc_ids: string[];
+}
+
+export interface StructuredCaseSummary {
+  case_overview: CaseSummarySection;
+  key_incidents: CaseSummarySection;
+  persons_of_interest: CaseSummarySection;
+  evidence_summary: CaseSummarySection;
+  investigation_status: CaseSummarySection;
+}
+
 export interface CaseSummaryResponse {
-  case_id: string;
-  case_number: string;
-  executive_summary: string;
-  key_findings: string[];
-  timeline_highlights: Array<{
+  case_id?: string;
+  case_number?: string;
+  summary: StructuredCaseSummary;
+  cited_doc_ids: string[];
+  citations?: Array<{
+    chunk_id: string;
+    doc_id: string;
+    doc_title: string;
+    doc_type: string;
+    sensitivity_level: SensitivityLevel;
+    case_id: string;
+    chunk_text: string;
+    similarity_score: number;
+  }>;
+  chunks_used: number;
+  requires_human_verification: true;
+  generated_at: string;
+  // Optional backward compatibility fields
+  executive_summary?: string;
+  key_findings?: string[];
+  timeline_highlights?: Array<{
     date: string;
     event: string;
     doc_id: string;
     sensitivity_level: SensitivityLevel;
   }>;
-  cited_doc_ids: string[];
-  requires_human_verification: true;
-  generated_at: string;
 }

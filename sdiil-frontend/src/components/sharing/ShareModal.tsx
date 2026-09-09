@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { DocumentRecord, ConsentReceipt, SharingApproval } from '@/types/document.types';
 import { Modal } from '@/components/ui/Modal';
 import { Button } from '@/components/ui/Button';
@@ -6,9 +6,8 @@ import { Input } from '@/components/ui/Input';
 import { Alert } from '@/components/ui/Alert';
 import { SensitivityBadge } from '@/components/ui/SensitivityBadge';
 import { ConsentReceiptCard } from './ConsentReceiptCard';
-import { sharingService } from '@/services/sharing.service';
+import { sharingService, RecipientOption } from '@/services/sharing.service';
 import { useAuth } from '@/hooks/useAuth';
-import { INITIAL_USERS } from '@/services/api';
 import { Share2, ShieldAlert } from 'lucide-react';
 
 export interface ShareModalProps {
@@ -25,7 +24,8 @@ export const ShareModal: React.FC<ShareModalProps> = ({
   onSuccess,
 }) => {
   const { user } = useAuth();
-  const [recipientUserId, setRecipientUserId] = useState<string>('usr-004'); // default Kavita Sen (Prosecutor)
+  const [recipients, setRecipients] = useState<RecipientOption[]>([]);
+  const [recipientUserId, setRecipientUserId] = useState<string>('');
   const [shareReason, setShareReason] = useState<string>('');
   const [expiryHours, setExpiryHours] = useState<number>(48);
   const [isLoading, setIsLoading] = useState(false);
@@ -33,6 +33,21 @@ export const ShareModal: React.FC<ShareModalProps> = ({
 
   const [dualAuthPending, setDualAuthPending] = useState<SharingApproval | null>(null);
   const [generatedReceipt, setGeneratedReceipt] = useState<ConsentReceipt | null>(null);
+
+  useEffect(() => {
+    async function loadRecipients() {
+      const list = await sharingService.getRecipients();
+      setRecipients(list);
+      // Pick first recipient who is not current user
+      const eligible = list.find((u) => u.user_id !== user?.user_id);
+      if (eligible) {
+        setRecipientUserId(eligible.user_id);
+      }
+    }
+    if (isOpen) {
+      loadRecipients();
+    }
+  }, [isOpen, user?.user_id]);
 
   if (!doc) return null;
 
@@ -45,7 +60,7 @@ export const ShareModal: React.FC<ShareModalProps> = ({
     setIsLoading(true);
     setError(null);
 
-    const selectedRecipient = INITIAL_USERS.find((u) => u.user_id === recipientUserId);
+    const selectedRecipient = recipients.find((u) => u.user_id === recipientUserId);
 
     try {
       const res = await sharingService.initiateShare({
@@ -53,9 +68,9 @@ export const ShareModal: React.FC<ShareModalProps> = ({
         initiatorId: user.user_id,
         initiatorName: user.full_name || user.username,
         initiatorRole: user.role,
-        recipientUserId: selectedRecipient?.user_id,
+        recipientUserId: selectedRecipient?.user_id || recipientUserId,
         recipientName: selectedRecipient?.full_name,
-        recipientRole: selectedRecipient?.role || 'PROSECUTOR',
+        recipientRole: selectedRecipient?.role || 'JUDGE',
         shareReason,
         expiryHours,
       });
@@ -81,6 +96,8 @@ export const ShareModal: React.FC<ShareModalProps> = ({
     setError(null);
     onClose();
   };
+
+  const filteredRecipients = recipients.filter((u) => u.user_id !== user?.user_id);
 
   return (
     <Modal
@@ -123,8 +140,8 @@ export const ShareModal: React.FC<ShareModalProps> = ({
               </div>
               <p className="text-xs text-text-secondary leading-relaxed">
                 Your share request for Sensitivity-A material has halted in <strong>PENDING</strong>{' '}
-                status. Notifications have been dispatched to all assigned Case Supervisors. Access
-                will be provisioned once approved.
+                status. Notifications have been dispatched to assigned Case Supervisors. Recipient
+                access will be provisioned once approved.
               </p>
             </div>
 
@@ -160,7 +177,7 @@ export const ShareModal: React.FC<ShareModalProps> = ({
                 onChange={(e) => setRecipientUserId(e.target.value)}
                 className="w-full bg-bg-elevated text-text-primary border border-border rounded-input text-body p-2 outline-none focus:border-accent-primary"
               >
-                {INITIAL_USERS.filter((u) => u.user_id !== user?.user_id).map((u) => (
+                {filteredRecipients.map((u) => (
                   <option key={u.user_id} value={u.user_id}>
                     {u.full_name} ({u.role}) — {u.department}
                   </option>

@@ -1,4 +1,11 @@
 {
+  "name": "anvesh-sdiil",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev --prefix sdiil-frontend",
+    "dev:frontend": "npm run dev --prefix sdiil-frontend",
+    "dev:backend": "npm run dev --prefix sdiil-backend"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.116.0"
   }

@@ -80,7 +80,7 @@ export function useDocuments(caseId?: string) {
 
   const downloadDocument = async (doc: DocumentRecord) => {
     if (!user) throw new Error('Authentication required');
-    const blob = await documentsService.downloadDocument(
+    const { blob, filename } = await documentsService.downloadDocument(
       doc.file_id,
       user.user_id,
       user.full_name || user.username
@@ -89,7 +89,7 @@ export function useDocuments(caseId?: string) {
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${doc.title.replace(/[^a-zA-Z0-9_-]/g, '_')}_v${doc.version}.txt`;
+    a.download = filename || `${doc.title.replace(/[^a-zA-Z0-9_-]/g, '_')}_v${doc.version}.pdf`;
     document.body.appendChild(a);
     a.click();
     window.URL.revokeObjectURL(url);

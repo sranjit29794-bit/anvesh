@@ -81,9 +81,17 @@ export interface DocumentUploadResponse {
 export interface TamperVerificationResult {
   doc_id: string;
   case_id: string;
+  case_number?: string;
+  doc_title?: string;
+  doc_type?: string;
+  version_number?: number;
+  checked_by?: string;
+  status?: 'VERIFIED' | 'TAMPERED';
+  is_valid?: boolean;
   verification_status: 'VERIFIED' | 'TAMPERED';
   original_hash: string;
   computed_hash: string;
+  registered_hash?: string;
   hashes_match: boolean;
   storage_integrity_failure: boolean;
   system_signature: string;
@@ -112,26 +120,14 @@ export interface AuditLogEntry {
   log_id: string;
   user_id: string;
   username: string;
-  action:
-    | 'UPLOAD_ATTEMPT'
-    | 'DOCUMENT_UPLOADED'
-    | 'DOCUMENT_VIEWED'
-    | 'DOCUMENT_DOWNLOADED'
-    | 'SEARCH_QUERY'
-    | 'SHARE_INITIATED'
-    | 'SHARE_APPROVED'
-    | 'SHARE_REJECTED'
-    | 'DOCUMENT_SHARED'
-    | 'DOCUMENT_FIRST_OPENED'
-    | 'VERIFICATION_REQUESTED'
-    | 'VERIFICATION_REPORT_GENERATED'
-    | 'LOGIN_SUCCESS'
-    | 'LOGIN_FAILED'
-    | 'MFA_FAILED'
-    | 'MFA_LOCKOUT'
-    | 'ADMIN_USER_MODIFIED';
+  user_role?: string;
+  action: string;
+  resource_type?: string;
+  resource_id?: string;
+  description?: string;
   doc_id?: string;
   case_id?: string;
+  case_number?: string;
   timestamp: string;
   ip_address: string;
   metadata?: Record<string, unknown>;

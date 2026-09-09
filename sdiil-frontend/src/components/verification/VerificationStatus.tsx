@@ -52,10 +52,35 @@ export const VerificationStatus: React.FC<VerificationStatusProps> = ({ result }
 
       {/* Hash Verification Comparative Grid */}
       <Card className="space-y-4">
-        <h3 className="text-h3 font-semibold text-text-primary flex items-center gap-2 pb-3 border-b border-border">
-          <Hash className="w-4 h-4 text-accent-primary" />
-          Cryptographic Evidence Ledger Inspection
-        </h3>
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 pb-3 border-b border-border">
+          <h3 className="text-h3 font-semibold text-text-primary flex items-center gap-2">
+            <Hash className="w-4 h-4 text-accent-primary" />
+            Cryptographic Evidence Ledger Inspection
+          </h3>
+          {(result.doc_title || result.case_number) && (
+            <div className="flex items-center gap-2 text-xs">
+              {result.case_number && (
+                <span className="px-2 py-0.5 rounded bg-bg-secondary text-accent-primary font-mono font-medium border border-border">
+                  {result.case_number}
+                </span>
+              )}
+              {result.version_number && (
+                <span className="px-2 py-0.5 rounded bg-bg-secondary text-text-secondary font-mono font-medium border border-border">
+                  v{result.version_number}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+
+        {result.doc_title && (
+          <div className="text-xs text-text-secondary">
+            Inspecting Document: <strong className="text-text-primary">{result.doc_title}</strong>
+            {result.checked_by && (
+              <span> • Verification Officer: <strong className="text-text-primary">{result.checked_by}</strong></span>
+            )}
+          </div>
+        )}
 
         <div className="space-y-3 font-mono text-xs">
           <div className="p-3 rounded-card bg-bg-secondary border border-border">
@@ -64,7 +89,7 @@ export const VerificationStatus: React.FC<VerificationStatusProps> = ({ result }
               <span className="text-accent-primary">Anchor Origin</span>
             </div>
             <div className="text-text-primary break-all select-all font-semibold">
-              {result.original_hash}
+              {result.registered_hash || result.original_hash}
             </div>
           </div>
 

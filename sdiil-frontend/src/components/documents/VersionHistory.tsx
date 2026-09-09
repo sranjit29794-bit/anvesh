@@ -5,7 +5,7 @@ import { Card } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { formatDate } from '@/utils/formatDate';
-import { GitCommit, History, Plus, HardDrive, CheckCircle2 } from 'lucide-react';
+import { GitCommit, History, Plus, HardDrive, CheckCircle2, Download } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 
 export interface VersionHistoryProps {
@@ -22,6 +22,8 @@ export const VersionHistory: React.FC<VersionHistoryProps> = ({ document: doc, o
   const [file, setFile] = useState<File | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  const [downloadingVersion, setDownloadingVersion] = useState<number | null>(null);
+
   const loadVersions = useCallback(async () => {
     setIsLoading(true);
     const data = await documentsService.getDocumentVersions(doc.file_id);
@@ -32,6 +34,31 @@ export const VersionHistory: React.FC<VersionHistoryProps> = ({ document: doc, o
   useEffect(() => {
     loadVersions();
   }, [loadVersions]);
+
+  const handleDownloadVersion = async (versionNumber: number) => {
+    if (!user) return;
+    try {
+      setDownloadingVersion(versionNumber);
+      const { filename, blob } = await documentsService.downloadDocument(
+        doc.file_id,
+        user.user_id,
+        user.full_name || user.username,
+        versionNumber
+      );
+      const url = window.URL.createObjectURL(blob);
+      const a = window.document.createElement('a');
+      a.href = url;
+      a.download = filename || `${doc.title.replace(/[^a-zA-Z0-9_-]/g, '_')}_v${versionNumber}.pdf`;
+      window.document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      window.document.body.removeChild(a);
+    } catch (err: any) {
+      alert(err?.message || `Failed to download version ${versionNumber}`);
+    } finally {
+      setDownloadingVersion(null);
+    }
+  };
 
   const handleNewVersion = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -50,8 +77,8 @@ export const VersionHistory: React.FC<VersionHistoryProps> = ({ document: doc, o
       setShowUploadForm(false);
       await loadVersions();
       if (onVersionAdded) onVersionAdded();
-    } catch {
-      alert('Failed to register new version');
+    } catch (err: any) {
+      alert(err?.message || 'Failed to register new version');
     } finally {
       setIsSubmitting(false);
     }
@@ -152,7 +179,19 @@ export const VersionHistory: React.FC<VersionHistoryProps> = ({ document: doc, o
                       </span>
                     )}
                   </div>
-                  <span className="text-[11px] text-text-muted">{formatDate(v.created_at)}</span>
+                  <div className="flex items-center gap-3">
+                    <span className="text-[11px] text-text-muted">{formatDate(v.created_at)}</span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="text-xs h-7 px-2.5 text-accent-primary hover:bg-accent-primary/10 border border-accent-primary/20"
+                      isLoading={downloadingVersion === v.version_number}
+                      onClick={() => handleDownloadVersion(v.version_number)}
+                      leftIcon={<Download className="w-3 h-3" />}
+                    >
+                      Download v{v.version_number}
+                    </Button>
+                  </div>
                 </div>
 
                 <p className="text-xs text-text-secondary mb-2">

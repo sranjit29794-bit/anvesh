@@ -4,6 +4,7 @@ import { ShieldCheck, ShieldAlert } from 'lucide-react';
 export interface TamperBadgeProps {
   status: 'VERIFIED' | 'TAMPERED';
   hashesMatch?: boolean;
+  hash?: string;
   className?: string;
   size?: 'sm' | 'md' | 'lg';
 }
@@ -11,6 +12,7 @@ export interface TamperBadgeProps {
 export const TamperBadge: React.FC<TamperBadgeProps> = ({
   status,
   hashesMatch = true,
+  hash,
   className = '',
   size = 'md',
 }) => {
@@ -39,13 +41,15 @@ export const TamperBadge: React.FC<TamperBadgeProps> = ({
     );
   }
 
+  const hashSnippet = hash ? `${hash.slice(0, 8)}...` : '';
+
   return (
     <span
       className={`inline-flex items-center rounded-btn font-mono uppercase tracking-wider bg-accent-success/15 text-accent-success border border-accent-success/40 ${sizeStyles} ${className}`}
-      title="Cryptographic integrity confirmed: Recomputed SHA-256 matches blockchain immutable anchor."
+      title={hash ? `Blockchain anchored SHA-256: ${hash}` : 'Cryptographic integrity confirmed: Recomputed SHA-256 matches blockchain immutable anchor.'}
     >
       <ShieldCheck className={`${iconSize} shrink-0`} />
-      <span>VERIFIED (SHA-256 MATCH)</span>
+      <span>{hash ? `REGISTERED: ${hashSnippet}` : 'VERIFIED (SHA-256 MATCH)'}</span>
     </span>
   );
 };

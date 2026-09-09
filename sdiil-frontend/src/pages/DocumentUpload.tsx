@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { DocumentUpload as DocumentUploadComponent } from '@/components/documents/DocumentUpload';
 import { useAuth } from '@/hooks/useAuth';
 import { db } from '@/services/api';
-import { CaseRecord } from '@/types/case.types';
 import { Button } from '@/components/ui/Button';
 import { ArrowLeft, FolderLock } from 'lucide-react';
 
@@ -15,21 +14,33 @@ export const DocumentUpload: React.FC<DocumentUploadPageProps> = ({
   navigate,
   defaultCaseId,
 }) => {
-  const { user } = useAuth();
-  const [cases, setCases] = useState<CaseRecord[]>([]);
+  const { user, caseAssignments } = useAuth();
+  const [caseList, setCaseList] = useState<Array<{ id: string; case_number: string; title: string }>>([]);
   const [selectedCaseId, setSelectedCaseId] = useState<string>(
-    defaultCaseId || 'case-del-2024-001'
+    defaultCaseId || 'MH-PN-2026-0142'
   );
 
   useEffect(() => {
-    const assigned = db.cases.filter(
-      (c) => user?.role === 'ADMIN' || (user?.case_ids && user.case_ids.includes(c.case_id))
-    );
-    setCases(assigned);
-    if (assigned.length > 0 && !assigned.some((c) => c.case_id === selectedCaseId)) {
-      setSelectedCaseId(assigned[0].case_id);
+    if (caseAssignments && caseAssignments.length > 0) {
+      const realCases = caseAssignments.map((a) => ({
+        id: a.cases?.id || a.case_id,
+        case_number: a.cases?.case_number || a.case_id,
+        title: a.cases?.title || 'Assigned Case',
+      }));
+      setCaseList(realCases);
+      if (!realCases.some((c) => c.id === selectedCaseId || c.case_number === selectedCaseId)) {
+        setSelectedCaseId(realCases[0].id);
+      }
+    } else {
+      const assigned = db.cases
+        .filter((c) => user?.role === 'ADMIN' || (user?.case_ids && user.case_ids.includes(c.case_id)))
+        .map((c) => ({ id: c.case_id, case_number: c.case_number, title: c.title }));
+      setCaseList(assigned);
+      if (assigned.length > 0 && !assigned.some((c) => c.id === selectedCaseId)) {
+        setSelectedCaseId(assigned[0].id);
+      }
     }
-  }, [user, selectedCaseId]);
+  }, [user, caseAssignments, selectedCaseId]);
 
   return (
     <div className="space-y-6 max-w-4xl mx-auto">
@@ -52,9 +63,9 @@ export const DocumentUpload: React.FC<DocumentUploadPageProps> = ({
             onChange={(e) => setSelectedCaseId(e.target.value)}
             className="bg-bg-elevated text-text-primary text-xs border border-border rounded-input py-1.5 px-3 outline-none focus:border-accent-primary"
           >
-            {cases.map((c) => (
-              <option key={c.case_id} value={c.case_id}>
-                {c.case_number} — {c.title.slice(0, 30)}...
+            {caseList.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.case_number} — {c.title.slice(0, 35)}...
               </option>
             ))}
           </select>

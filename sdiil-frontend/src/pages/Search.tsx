@@ -2,7 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { useSearch } from '@/hooks/useSearch';
 import { db } from '@/services/api';
-import { CaseRecord } from '@/types/case.types';
 import { SearchBar } from '@/components/search/SearchBar';
 import { SearchResult } from '@/components/search/SearchResult';
 import { Card } from '@/components/ui/Card';
@@ -15,19 +14,31 @@ export interface SearchPageProps {
 }
 
 export const Search: React.FC<SearchPageProps> = ({ onSelectDoc }) => {
-  const { user } = useAuth();
-  const [cases, setCases] = useState<CaseRecord[]>([]);
-  const [selectedCaseId, setSelectedCaseId] = useState<string>('case-del-2024-001');
+  const { user, caseAssignments } = useAuth();
+  const [cases, setCases] = useState<Array<{ id: string; case_number: string; title: string }>>([]);
+  const [selectedCaseId, setSelectedCaseId] = useState<string>('');
 
   useEffect(() => {
-    const assigned = db.cases.filter(
-      (c) => user?.role === 'ADMIN' || (user?.case_ids && user.case_ids.includes(c.case_id))
-    );
-    setCases(assigned);
-    if (assigned.length > 0 && !assigned.some((c) => c.case_id === selectedCaseId)) {
-      setSelectedCaseId(assigned[0].case_id);
+    if (caseAssignments && caseAssignments.length > 0) {
+      const list = [
+        { id: '', case_number: 'All Assigned Cases (Cross-Case Scope)', title: 'All Assigned Cases' },
+        ...caseAssignments.map((a) => ({
+          id: a.cases?.id || a.case_id,
+          case_number: a.cases?.case_number || a.case_id,
+          title: a.cases?.title || 'Assigned Case',
+        })),
+      ];
+      setCases(list);
+    } else {
+      const assigned = [
+        { id: '', case_number: 'All Assigned Cases (Cross-Case Scope)', title: 'All Assigned Cases' },
+        ...db.cases
+          .filter((c) => user?.role === 'ADMIN' || (user?.case_ids && user.case_ids.includes(c.case_id)))
+          .map((c) => ({ id: c.case_id, case_number: c.case_number, title: c.title })),
+      ];
+      setCases(assigned);
     }
-  }, [user, selectedCaseId]);
+  }, [user, caseAssignments]);
 
   const { query, setQuery, result, isLoading, error, executeSearch } = useSearch(selectedCaseId);
 
@@ -55,7 +66,7 @@ export const Search: React.FC<SearchPageProps> = ({ onSelectDoc }) => {
             className="bg-transparent text-text-primary text-xs font-semibold outline-none cursor-pointer"
           >
             {cases.map((c) => (
-              <option key={c.case_id} value={c.case_id} className="bg-bg-card">
+              <option key={c.id || 'all'} value={c.id} className="bg-bg-card">
                 {c.case_number}
               </option>
             ))}

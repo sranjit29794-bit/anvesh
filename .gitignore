@@ -14,6 +14,5 @@ yarn-error.log*
 Thumbs.db
 .agents/
 sdiil-backend/seed-assets/
-sdiil-frontend/src/config/demoMfaSecrets.json
 sdiil-backend/supabase/.temp
 sdiil-backend/supabase/.branches

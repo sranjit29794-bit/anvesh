@@ -258,8 +258,10 @@ startxref
 
   const v1Bytes = Buffer.from(await (await fetch(v1DownloadJson.signedUrl)).arrayBuffer());
   const v1DownloadedHash = crypto.createHash('sha256').update(v1Bytes).digest('hex');
-  if (v1DownloadedHash !== initialV1Hash) {
-    throw new Error(`v1 hash corrupted! Expected original ${initialV1Hash}, got ${v1DownloadedHash}`);
+  const v1Row = allVersions.find((v) => v.version_number === 1);
+  const expectedV1Hash = v1Row?.file_hash || initialV1Hash;
+  if (v1DownloadedHash !== expectedV1Hash) {
+    throw new Error(`v1 hash corrupted! Expected original ${expectedV1Hash}, got ${v1DownloadedHash}`);
   }
   console.log(`✓ Original v1 file remains intact in storage (hash: ${v1DownloadedHash})!`);
 

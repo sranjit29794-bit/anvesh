@@ -7,7 +7,6 @@ import {
   Share2,
   ShieldCheck,
   History,
-  ShieldAlert,
   Menu,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
@@ -60,15 +59,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: '/verification', label: 'Tamper Verification', icon: ShieldCheck },
     { id: '/audit', label: 'Audit Trail', icon: History },
   ];
-
-  // Admin panel visible to ADMIN or SUPERVISOR
-  if (user?.role === 'ADMIN' || user?.role === 'SUPERVISOR') {
-    navItems.push({
-      id: '/admin',
-      label: 'Admin Control',
-      icon: ShieldAlert,
-    });
-  }
 
   return (
     <aside

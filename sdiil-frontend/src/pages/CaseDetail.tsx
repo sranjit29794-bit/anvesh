@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { db } from '@/services/api';
+import { supabase } from '@/services/supabase.client';
 import { CaseRecord, CaseSummaryResponse, StructuredCaseSummary } from '@/types/case.types';
 import { DocumentRecord, DocType, SensitivityLevel, RAGSearchCitation } from '@/types/document.types';
 import { useAuth } from '@/hooks/useAuth';
@@ -26,6 +27,12 @@ import {
   ShieldAlert,
   Clock,
   ShieldCheck,
+  CheckCircle,
+  XCircle,
+  Eye,
+  Download,
+  Table as TableIcon,
+  LayoutGrid,
 } from 'lucide-react';
 
 export interface CaseDetailProps {
@@ -42,8 +49,9 @@ export const CaseDetail: React.FC<CaseDetailProps> = ({
   navigate,
 }) => {
   const { user } = useAuth();
+  const effectiveCaseId = caseId || (typeof window !== 'undefined' ? window.location.pathname.replace(/^\/cases\/?/, '').trim() : '');
   const { documents, isLoading, downloadDocument, toggleTamper, checkUploadPermission } =
-    useDocuments(caseId);
+    useDocuments(effectiveCaseId);
 
   const [currentCase, setCurrentCase] = useState<CaseRecord | null>(null);
   const [activeTab, setActiveTab] = useState<'evidence' | 'summary'>('evidence');
@@ -52,11 +60,77 @@ export const CaseDetail: React.FC<CaseDetailProps> = ({
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [sharingDoc, setSharingDoc] = useState<DocumentRecord | null>(null);
   const [filterType, setFilterType] = useState<string>('ALL');
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'PENDING_REVIEW' | 'ACTIVE' | 'REJECTED'>('ALL');
+  const [viewMode, setViewMode] = useState<'table' | 'grid'>('table');
 
   useEffect(() => {
-    const c = db.cases.find((item) => item.case_id === caseId);
-    if (c) setCurrentCase(c);
-  }, [caseId]);
+    async function loadCaseData() {
+      if (!effectiveCaseId) return;
+
+      // 1. Check in-memory DB
+      const c = db.cases.find((item) => item.case_id === effectiveCaseId || (item as any).id === effectiveCaseId);
+      if (c) {
+        setCurrentCase(c);
+        return;
+      }
+
+      // 2. Fetch from backend /api/v1/cases/:caseId
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        const token = session?.access_token;
+        const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
+
+        if (token) {
+          const res = await fetch(`${apiBase}/cases/${effectiveCaseId}`, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          });
+          if (res.ok) {
+            const json = await res.json();
+            if (json.case) {
+              setCurrentCase(json.case);
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[CaseDetail] Failed to load case from backend:', err);
+      }
+
+      // 3. Fallback: Query Supabase directly
+      try {
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(effectiveCaseId);
+        let query = supabase.from('cases').select('*');
+        if (isUuid) {
+          query = query.eq('id', effectiveCaseId);
+        } else {
+          query = query.eq('case_number', effectiveCaseId);
+        }
+        const { data: directCase } = await query.maybeSingle();
+        if (directCase) {
+          setCurrentCase({
+            case_id: directCase.id,
+            case_number: directCase.case_number,
+            title: directCase.title,
+            department: 'ICJS Crime Branch',
+            investigating_officer: 'Inspector M. Deshmukh',
+            status: directCase.status === 'closed' ? 'CLOSED' : 'UNDER_INVESTIGATION',
+            created_at: directCase.created_at,
+            updated_at: directCase.created_at,
+            document_counts: { total: 0, sensitivity_a: 0, sensitivity_b: 0, sensitivity_c: 0, by_type: {} },
+            assigned_members: [],
+          });
+        }
+      } catch (err) {
+        console.warn('[CaseDetail] Direct Supabase fallback failed:', err);
+      }
+    }
+
+    loadCaseData();
+  }, [effectiveCaseId]);
 
   const handleGenerateSummary = async () => {
     if (!user) return;
@@ -80,10 +154,25 @@ export const CaseDetail: React.FC<CaseDetailProps> = ({
 
   const uploadPerm = checkUploadPermission();
 
+  const isSupervisorOrAdmin = user?.role === 'SUPERVISOR' || user?.role === 'ADMIN';
+  const isUploaderOnAny = documents.some((d) => d.uploader_id === user?.user_id);
+  const canSeePendingTab = isSupervisorOrAdmin || isUploaderOnAny;
+
+  const allCount = documents.length;
+  const pendingCount = documents.filter((d) => d.status === 'PENDING_REVIEW').length;
+  const activeCount = documents.filter((d) => (d.status || 'ACTIVE') === 'ACTIVE').length;
+  const rejectedCount = documents.filter((d) => d.status === 'REJECTED').length;
+
+  const docsByStatus = documents.filter((d) => {
+    if (statusFilter === 'ALL') return true;
+    if (statusFilter === 'ACTIVE') return (d.status || 'ACTIVE') === 'ACTIVE';
+    return d.status === statusFilter;
+  });
+
   const filteredDocs =
     filterType === 'ALL'
-      ? documents
-      : documents.filter((d) => d.sensitivity_level === filterType || d.doc_type === filterType);
+      ? docsByStatus
+      : docsByStatus.filter((d) => d.sensitivity_level === filterType || d.doc_type === filterType);
 
   if (!currentCase) {
     return (
@@ -192,29 +281,116 @@ export const CaseDetail: React.FC<CaseDetailProps> = ({
       {/* TAB 1: EVIDENCE & EXHIBITS */}
       {activeTab === 'evidence' && (
         <div className="space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-            <div>
-              <h3 className="text-h2 font-semibold text-text-primary">Case Evidences & Exhibits</h3>
-              <p className="text-xs text-text-secondary">
-                Showing {filteredDocs.length} evidence file(s) registered under {currentCase.case_number}.
-              </p>
+          {/* Attestation Status Filter Tabs */}
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-2 border-b border-border">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setStatusFilter('ALL')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-btn text-xs font-medium transition-colors cursor-pointer ${
+                  statusFilter === 'ALL'
+                    ? 'bg-accent-primary text-white font-semibold shadow-sm'
+                    : 'bg-bg-elevated text-text-secondary hover:text-text-primary'
+                }`}
+              >
+                <span>All</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-black/20 font-mono">
+                  {allCount}
+                </span>
+              </button>
+
+              {canSeePendingTab && (
+                <button
+                  type="button"
+                  onClick={() => setStatusFilter('PENDING_REVIEW')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-btn text-xs font-medium transition-colors cursor-pointer ${
+                    statusFilter === 'PENDING_REVIEW'
+                      ? 'bg-[#F5A623] text-black font-semibold shadow-sm'
+                      : 'bg-bg-elevated text-text-secondary hover:text-text-primary'
+                  }`}
+                >
+                  <Clock className="w-3.5 h-3.5" />
+                  <span>Pending Review</span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-black/20 font-mono">
+                    {pendingCount}
+                  </span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => setStatusFilter('ACTIVE')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-btn text-xs font-medium transition-colors cursor-pointer ${
+                  statusFilter === 'ACTIVE'
+                    ? 'bg-accent-success text-white font-semibold shadow-sm'
+                    : 'bg-bg-elevated text-text-secondary hover:text-text-primary'
+                }`}
+              >
+                <CheckCircle className="w-3.5 h-3.5" />
+                <span>Active</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-black/20 font-mono">
+                  {activeCount}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setStatusFilter('REJECTED')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-btn text-xs font-medium transition-colors cursor-pointer ${
+                  statusFilter === 'REJECTED'
+                    ? 'bg-accent-danger text-white font-semibold shadow-sm'
+                    : 'bg-bg-elevated text-text-secondary hover:text-text-primary'
+                }`}
+              >
+                <XCircle className="w-3.5 h-3.5" />
+                <span>Rejected</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-black/20 font-mono">
+                  {rejectedCount}
+                </span>
+              </button>
             </div>
 
-            <div className="flex items-center gap-2">
-              <span className="text-label text-text-muted">Filter:</span>
-              <select
-                value={filterType}
-                onChange={(e) => setFilterType(e.target.value)}
-                className="bg-bg-elevated text-text-primary text-xs border border-border rounded-input py-1.5 px-2.5 outline-none focus:border-accent-primary cursor-pointer"
-              >
-                <option value="ALL">All Levels & Types</option>
-                <option value="A">Sensitivity A (Dual-Auth)</option>
-                <option value="B">Sensitivity B</option>
-                <option value="C">Sensitivity C</option>
-                <option value="FIR">FIRs</option>
-                <option value="WITNESS_STATEMENT">Witness Statements</option>
-                <option value="FORENSIC_REPORT">Forensic Reports</option>
-              </select>
+            {/* Right Controls: Type Filter & View Mode Toggle */}
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2">
+                <span className="text-label text-text-muted">Type:</span>
+                <select
+                  value={filterType}
+                  onChange={(e) => setFilterType(e.target.value)}
+                  className="bg-bg-elevated text-text-primary text-xs border border-border rounded-input py-1.5 px-2.5 outline-none focus:border-accent-primary cursor-pointer"
+                >
+                  <option value="ALL">All Sensitivity & Types</option>
+                  <option value="A">Sensitivity A (Dual-Auth)</option>
+                  <option value="B">Sensitivity B</option>
+                  <option value="C">Sensitivity C</option>
+                  <option value="FIR">FIRs</option>
+                  <option value="WITNESS_STATEMENT">Witness Statements</option>
+                  <option value="FORENSIC_REPORT">Forensic Reports</option>
+                </select>
+              </div>
+
+              <div className="flex items-center bg-bg-elevated border border-border rounded-btn p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setViewMode('table')}
+                  className={`p-1.5 rounded text-xs transition-colors cursor-pointer ${
+                    viewMode === 'table' ? 'bg-bg-card text-accent-primary shadow-sm font-semibold' : 'text-text-muted hover:text-text-primary'
+                  }`}
+                  title="Table View"
+                >
+                  <TableIcon className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode('grid')}
+                  className={`p-1.5 rounded text-xs transition-colors cursor-pointer ${
+                    viewMode === 'grid' ? 'bg-bg-card text-accent-primary shadow-sm font-semibold' : 'text-text-muted hover:text-text-primary'
+                  }`}
+                  title="Grid View"
+                >
+                  <LayoutGrid className="w-4 h-4" />
+                </button>
+              </div>
             </div>
           </div>
 
@@ -222,7 +398,109 @@ export const CaseDetail: React.FC<CaseDetailProps> = ({
             <div className="py-12 text-center text-xs text-text-muted">Loading vault records...</div>
           ) : filteredDocs.length === 0 ? (
             <Card className="py-12 text-center text-xs text-text-muted">
-              No documents matching the selected filter criteria.
+              No documents matching the selected status or filter criteria.
+            </Card>
+          ) : viewMode === 'table' ? (
+            <Card className="overflow-hidden p-0 border border-border">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead>
+                    <tr className="bg-bg-elevated border-b border-border text-text-muted font-mono uppercase text-[10px]">
+                      <th className="py-3 px-4">Document Title</th>
+                      <th className="py-3 px-4">Type & Version</th>
+                      <th className="py-3 px-4">Clearance</th>
+                      <th className="py-3 px-4">Status</th>
+                      <th className="py-3 px-4">Integrity Hash</th>
+                      <th className="py-3 px-4">Uploaded</th>
+                      <th className="py-3 px-4 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border/60">
+                    {filteredDocs.map((doc) => {
+                      return (
+                        <tr key={doc.file_id} className="hover:bg-bg-elevated/40 transition-colors">
+                          <td className="py-3.5 px-4 font-semibold text-text-primary max-w-xs">
+                            <span
+                              className="cursor-pointer hover:text-accent-primary transition-colors"
+                              onClick={() => onSelectDoc(doc)}
+                            >
+                              {doc.title}
+                            </span>
+                            {doc.status === 'REJECTED' && doc.review_note && (
+                              <div className="text-[11px] font-normal text-accent-danger mt-0.5 truncate">
+                                Note: {doc.review_note}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3.5 px-4 font-mono text-text-secondary whitespace-nowrap">
+                            <span className="text-accent-primary">{doc.doc_type}</span>
+                            <span className="text-text-muted"> • v{doc.version}</span>
+                          </td>
+                          <td className="py-3.5 px-4 whitespace-nowrap">
+                            <span
+                              className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold font-mono ${
+                                doc.sensitivity_level === 'A'
+                                  ? 'bg-accent-danger/20 text-accent-danger border border-accent-danger/30'
+                                  : doc.sensitivity_level === 'B'
+                                  ? 'bg-accent-warning/20 text-accent-warning border border-accent-warning/30'
+                                  : 'bg-accent-primary/20 text-accent-primary border border-accent-primary/30'
+                              }`}
+                            >
+                              Level {doc.sensitivity_level}
+                            </span>
+                          </td>
+                          <td className="py-3.5 px-4 whitespace-nowrap">
+                            {doc.status === 'PENDING_REVIEW' && (
+                              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-medium bg-[#F5A623]/15 text-[#F5A623] border border-[#F5A623]/30">
+                                <Clock className="w-3.5 h-3.5" />
+                                Pending Review
+                              </span>
+                            )}
+                            {doc.status === 'ACTIVE' && (
+                              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-medium bg-accent-success/15 text-accent-success border border-accent-success/30">
+                                <CheckCircle className="w-3.5 h-3.5" />
+                                Active
+                              </span>
+                            )}
+                            {doc.status === 'REJECTED' && (
+                              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-medium bg-accent-danger/15 text-accent-danger border border-accent-danger/30">
+                                <XCircle className="w-3.5 h-3.5" />
+                                Rejected
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3.5 px-4 font-mono text-[11px] text-text-muted whitespace-nowrap">
+                            {doc.original_hash ? `${doc.original_hash.slice(0, 10)}...` : 'Pending'}
+                          </td>
+                          <td className="py-3.5 px-4 font-mono text-text-muted whitespace-nowrap">
+                            {new Date(doc.created_at).toLocaleDateString('en-GB')}
+                          </td>
+                          <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => onSelectDoc(doc)}
+                                leftIcon={<Eye className="w-3.5 h-3.5" />}
+                              >
+                                View
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => downloadDocument(doc)}
+                                leftIcon={<Download className="w-3.5 h-3.5" />}
+                              >
+                                Download
+                              </Button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </Card>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">

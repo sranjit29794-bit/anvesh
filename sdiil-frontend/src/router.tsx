@@ -10,7 +10,6 @@ import { Search } from '@/pages/Search';
 import { Sharing } from '@/pages/Sharing';
 import { AuditTrail } from '@/pages/AuditTrail';
 import { Verification } from '@/pages/Verification';
-import { AdminPanel } from '@/pages/AdminPanel';
 import { PageWrapper } from '@/components/layout/PageWrapper';
 import { DocumentRecord } from '@/types/document.types';
 
@@ -18,7 +17,7 @@ export const AppRouter: React.FC = () => {
   const { isAuthenticated, isMfaPending, caseAssignments } = useAuth();
   const [currentRoute, setCurrentRoute] = useState<string>('/dashboard');
   const [selectedCaseId, setSelectedCaseId] = useState<string>('MH-PN-2026-0142');
-  const [selectedDocId, setSelectedDocId] = useState<string>('doc-del-001');
+  const [selectedDocId, setSelectedDocId] = useState<string>('');
 
   // Sync selectedCaseId with user's assigned cases if available
   React.useEffect(() => {
@@ -87,10 +86,12 @@ export const AppRouter: React.FC = () => {
     }
 
     if (currentRoute.startsWith('/documents/')) {
+      const routeDocId = currentRoute.replace('/documents/', '').trim();
+      const activeDocId = routeDocId || selectedDocId;
       return (
         <DocumentView
-          docId={selectedDocId}
-          onBack={() => navigate(`/cases/${selectedCaseId}`)}
+          docId={activeDocId}
+          onBack={() => navigate(selectedCaseId ? `/cases/${selectedCaseId}` : '/dashboard')}
           navigate={navigate}
         />
       );
@@ -110,10 +111,6 @@ export const AppRouter: React.FC = () => {
 
     if (currentRoute === '/audit') {
       return <AuditTrail />;
-    }
-
-    if (currentRoute === '/admin') {
-      return <AdminPanel />;
     }
 
     // Default fallback

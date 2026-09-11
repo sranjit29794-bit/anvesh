@@ -1,6 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { anomalyService } from '../services/anomalyService.js';
 
 dotenv.config();
@@ -79,8 +81,28 @@ async function authenticateDemoUser(
   const { data: factors } = await supabase.auth.mfa.listFactors();
   const totpFactor = factors?.totp?.find((f) => f.status === 'verified');
 
-  if (totpFactor && totpSecret) {
-    const otpCode = generateTOTP(totpSecret);
+  let secret = totpSecret;
+  if (!secret) {
+    try {
+      const candidates = [
+        path.resolve(process.cwd(), 'sdiil-frontend/src/config/demoMfaSecrets.json'),
+        path.resolve(__dirname, '../../../sdiil-frontend/src/config/demoMfaSecrets.json'),
+        path.resolve(__dirname, '../../../../sdiil-frontend/src/config/demoMfaSecrets.json'),
+      ];
+      for (const p of candidates) {
+        if (fs.existsSync(p)) {
+          const json = JSON.parse(fs.readFileSync(p, 'utf8'));
+          secret = json[email.toLowerCase()]?.secret;
+          if (secret) break;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (totpFactor && secret) {
+    const otpCode = generateTOTP(secret);
     const { data: challengeData, error: challengeErr } = await supabase.auth.mfa.challenge({
       factorId: totpFactor.id,
     });
@@ -106,22 +128,19 @@ async function runAnomalyTests() {
   console.log('Authenticating demo users...');
   const officer = await authenticateDemoUser(
     'officer.demo@sdiil.test',
-    'Demo@Officer123',
-    'XXK4LHEU7K3XEOGWJ6TLIDYLWEWWQEQQ'
+    'Demo@Officer123'
   );
   console.log(`✓ Officer authenticated (ID: ${officer.userId})`);
 
   const judge = await authenticateDemoUser(
     'judge.demo@sdiil.test',
-    'Demo@Judge123',
-    'OA5BNS6MDGW4TN5F4Q7ZV2KW6K5EAR3D'
+    'Demo@Judge123'
   );
   console.log(`✓ Judge authenticated (ID: ${judge.userId})`);
 
   const admin = await authenticateDemoUser(
     'admin.demo@sdiil.test',
-    'Demo@Admin123',
-    'CBMDMYG5WT7W2GQXWOUXNG7MECH3LBIE'
+    'Demo@Admin123'
   );
   console.log(`✓ Admin authenticated (ID: ${admin.userId})`);
 

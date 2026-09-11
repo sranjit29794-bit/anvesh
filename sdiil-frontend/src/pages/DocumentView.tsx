@@ -24,6 +24,11 @@ export const DocumentView: React.FC<DocumentViewPageProps> = ({
   const [sharingDoc, setSharingDoc] = useState<DocumentRecord | null>(null);
 
   const fetchDoc = async () => {
+    if (!docId) {
+      setIsLoading(false);
+      setError('No document specified. Please select a document from a case folder or dashboard.');
+      return;
+    }
     try {
       setIsLoading(true);
       setError(null);

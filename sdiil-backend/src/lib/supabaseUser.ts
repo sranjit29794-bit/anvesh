@@ -1,7 +1,14 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 
+import path from 'path';
+
 dotenv.config();
+if (typeof __dirname !== 'undefined') {
+  dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+}
+dotenv.config({ path: path.resolve(process.cwd(), '.env') });
+dotenv.config({ path: path.resolve(process.cwd(), 'sdiil-backend/.env') });
 
 const supabaseUrl = process.env.SUPABASE_URL || 'https://placeholder.supabase.co';
 // We use anon key or service role with user auth header depending on configuration;

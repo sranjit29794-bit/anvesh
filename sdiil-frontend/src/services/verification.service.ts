@@ -33,8 +33,8 @@ export const verificationService = {
 
         if (response.ok) {
           const json = await response.json();
-          if (json.success && json.data) {
-            const d = json.data;
+          if (json.success) {
+            const d = json.data || json;
             return {
               doc_id: d.doc_id || docId,
               case_id: d.case_id || caseId,
@@ -62,8 +62,12 @@ export const verificationService = {
             };
           }
         }
+
+        const errJson = await response.json().catch(() => null);
+        throw new Error(errJson?.error || `Verification failed (HTTP ${response.status})`);
       } catch (err) {
-        console.warn('[verificationService] Backend verify call failed, falling back to local vault logic:', err);
+        console.error('[verificationService] Backend verify call failed:', err);
+        throw err;
       }
     }
 
@@ -128,7 +132,8 @@ export const verificationService = {
   async downloadVerificationReport(
     docId: string,
     versionNumber?: number,
-    docTitle?: string
+    docTitle?: string,
+    isTampered?: boolean
   ): Promise<void> {
     const {
       data: { session },
@@ -140,7 +145,10 @@ export const verificationService = {
       throw new Error('Authentication required to download verification certificate.');
     }
 
-    const queryParams = versionNumber !== undefined ? `?version_number=${versionNumber}` : '';
+    const params = new URLSearchParams();
+    if (versionNumber !== undefined) params.set('version_number', String(versionNumber));
+    if (isTampered) params.set('simulated_tamper', 'true');
+    const queryParams = params.toString() ? `?${params.toString()}` : '';
     const res = await fetch(`${apiBase}/documents/${docId}/verification-report${queryParams}`, {
       headers: {
         Authorization: `Bearer ${token}`,

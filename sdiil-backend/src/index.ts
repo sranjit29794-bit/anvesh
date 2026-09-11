@@ -9,6 +9,7 @@ import { searchRouter } from './routes/search.js';
 import { summaryRouter } from './routes/summary.js';
 import { anomaliesRouter } from './routes/anomalies.js';
 import { adminRouter } from './routes/admin.js';
+import { verifyPublicHandler } from './routes/verifyPublic.js';
 
 // Load environment variables
 dotenv.config();
@@ -23,6 +24,9 @@ app.use(cors({
   credentials: true,
 }));
 app.use(express.json());
+
+// Public independent verification route for court QR scans (no auth required)
+app.get('/verify/:docId/:hash', verifyPublicHandler);
 
 // API Routes
 app.use('/api/v1/documents', documentsRouter);

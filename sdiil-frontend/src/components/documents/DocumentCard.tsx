@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/Button';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { Card } from '@/components/ui/Card';
 import { formatDate, formatRelativeTime } from '@/utils/formatDate';
-import { Eye, Download, Share2, Clock, Lock, FileCode, Bug } from 'lucide-react';
+import { Eye, Download, Share2, Clock, Lock, FileCode, Bug, CheckCircle, XCircle } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { canViewDocument, canDownloadDocument, canInitiateShare } from '@/utils/roleGuard';
 
@@ -86,6 +86,24 @@ export const DocumentCard: React.FC<DocumentCardProps> = ({
           <span>v{doc.version}</span>
           <span>•</span>
           <span>{formatDate(doc.created_at)}</span>
+          {doc.status === 'PENDING_REVIEW' && (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-[#F5A623]/15 text-[#F5A623] border border-[#F5A623]/30">
+              <Clock className="w-3 h-3" />
+              Pending Review
+            </span>
+          )}
+          {doc.status === 'ACTIVE' && (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-accent-success/15 text-accent-success border border-accent-success/30">
+              <CheckCircle className="w-3 h-3" />
+              Active
+            </span>
+          )}
+          {doc.status === 'REJECTED' && (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-accent-danger/15 text-accent-danger border border-accent-danger/30">
+              <XCircle className="w-3 h-3" />
+              Rejected
+            </span>
+          )}
         </div>
 
         {/* Access Expiry Indicator if time-limited */}

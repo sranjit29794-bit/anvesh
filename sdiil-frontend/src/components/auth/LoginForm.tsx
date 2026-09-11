@@ -11,28 +11,46 @@ export interface LoginFormProps {
 
 const DEMO_PROFILES = [
   {
-    email: 'officer.demo@sdiil.test',
-    password: 'Demo@Officer123',
-    name: 'Insp. Vikram Rathore',
-    role: 'Officer (Investigator)',
+    email: 'admin.demo@sdiil.test',
+    password: 'Demo@Admin123',
+    name: 'System Administrator',
+    role: 'ADMIN (Full Clearance)',
   },
   {
     email: 'supervisor.demo@sdiil.test',
     password: 'Demo@Supervisor123',
     name: 'SP Sunita Sharma',
-    role: 'Supervisor (Dual-Auth)',
+    role: 'SUPERVISOR (Dual-Auth)',
   },
   {
-    email: 'admin.demo@sdiil.test',
-    password: 'Demo@Admin123',
-    name: 'System Administrator',
-    role: 'Admin (All Clearance)',
+    email: 'officer.demo@sdiil.test',
+    password: 'Demo@Officer123',
+    name: 'Insp. Vikram Rathore',
+    role: 'INVESTIGATOR (Upload/Search)',
+  },
+  {
+    email: 'prosecutor.demo@sdiil.test',
+    password: 'Demo@Prosecutor123',
+    name: 'Adv. Meera Sen',
+    role: 'PROSECUTOR (Case 0142)',
   },
   {
     email: 'judge.demo@sdiil.test',
     password: 'Demo@Judge123',
     name: 'Hon. Justice Rajesh Verma',
-    role: 'Judge (Assigned Cases)',
+    role: 'JUDGE (Cases 0198 & 0210)',
+  },
+  {
+    email: 'forensic.demo@sdiil.test',
+    password: 'Demo@Forensic123',
+    name: 'Dr. Subhash Bose',
+    role: 'FORENSIC_OFFICER (Lab Reports)',
+  },
+  {
+    email: 'registrar.demo@sdiil.test',
+    password: 'Demo@Registrar123',
+    name: 'Sh. Alok Mathur',
+    role: 'COURT_REGISTRAR (Registry)',
   },
 ];
 

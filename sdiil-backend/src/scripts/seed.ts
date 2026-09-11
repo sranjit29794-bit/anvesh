@@ -285,7 +285,11 @@ async function runSeed() {
 
   // Step 6: Upload 8 PDFs, Create documents, document_versions, & blockchain_events
   console.log('\n[6/7] Processing 8 seed PDFs (Hash, Upload, Document, Version, Blockchain Event)...');
-  const seedAssetsDir = path.resolve(process.cwd(), 'seed-assets');
+  const seedAssetsDir = fs.existsSync(path.resolve(process.cwd(), 'seed-assets'))
+    ? path.resolve(process.cwd(), 'seed-assets')
+    : fs.existsSync(path.resolve(process.cwd(), 'sdiil-backend/seed-assets'))
+    ? path.resolve(process.cwd(), 'sdiil-backend/seed-assets')
+    : path.resolve(__dirname, '../../seed-assets');
   let uploadedCount = 0;
   let blockchainEventsCount = 0;
 

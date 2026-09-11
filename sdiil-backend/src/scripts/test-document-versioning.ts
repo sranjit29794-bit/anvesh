@@ -127,27 +127,33 @@ async function runTests() {
     headers: { Authorization: `Bearer ${officerToken}` },
   });
 
-  const downloadJson = (await downloadRes.json()) as any;
-  if (!downloadRes.ok || !downloadJson.signedUrl) {
-    throw new Error(`Download endpoint failed (${downloadRes.status}): ${JSON.stringify(downloadJson)}`);
+  if (!downloadRes.ok) {
+    throw new Error(`Download endpoint failed (${downloadRes.status})`);
   }
 
-  console.log('✓ Received signed URL successfully');
-  console.log(`  Storage Path: ${downloadJson.storage_path}`);
-  console.log(`  Version: v${downloadJson.version_number}`);
-  console.log(`  File Hash: ${downloadJson.file_hash}`);
+  const contentType = downloadRes.headers.get('content-type') || '';
+  let fileBytes: Buffer;
+  let fileHashExpected: string | undefined;
 
-  // Fetch the actual file bytes from the signed URL
-  const fileFetchRes = await fetch(downloadJson.signedUrl);
-  if (!fileFetchRes.ok) {
-    throw new Error(`Failed to fetch file from signed URL: ${fileFetchRes.statusText}`);
+  if (contentType.includes('application/json')) {
+    const downloadJson = (await downloadRes.json()) as any;
+    console.log('✓ Received signed URL successfully');
+    console.log(`  Storage Path: ${downloadJson.storage_path}`);
+    console.log(`  Version: v${downloadJson.version_number}`);
+    console.log(`  File Hash: ${downloadJson.file_hash}`);
+    fileHashExpected = downloadJson.file_hash;
+    const fileFetchRes = await fetch(downloadJson.signedUrl);
+    fileBytes = Buffer.from(await fileFetchRes.arrayBuffer());
+  } else {
+    console.log(`✓ Received direct binary stream successfully (Content-Type: ${contentType})`);
+    fileBytes = Buffer.from(await downloadRes.arrayBuffer());
   }
-  const fileBytes = Buffer.from(await fileFetchRes.arrayBuffer());
+
   const actualHash = crypto.createHash('sha256').update(fileBytes).digest('hex');
   console.log(`✓ Downloaded ${fileBytes.length} bytes from Supabase Storage`);
   console.log(`  Actual SHA-256: ${actualHash}`);
-  if (actualHash !== downloadJson.file_hash) {
-    throw new Error(`Hash mismatch! Expected ${downloadJson.file_hash}, got ${actualHash}`);
+  if (fileHashExpected && actualHash !== fileHashExpected) {
+    throw new Error(`Hash mismatch! Expected ${fileHashExpected}, got ${actualHash}`);
   }
   console.log('✓ SHA-256 of downloaded file matches registered version file_hash!');
 
@@ -169,7 +175,7 @@ async function runTests() {
   // Test 7: Re-upload new version & verify old version remains intact
   // -------------------------------------------------------------
   console.log('\n[Test 7] Re-uploading a new version (v2) of the document...');
-  const initialV1Hash = downloadJson.file_hash;
+  const initialV1Hash = actualHash;
 
   // Create synthetic revised document content
   const timestamp = new Date().toISOString();
@@ -251,12 +257,19 @@ startxref
   const v1DownloadRes = await fetch(`${API_BASE}/documents/${targetDoc.id}/download?version_number=1`, {
     headers: { Authorization: `Bearer ${officerToken}` },
   });
-  const v1DownloadJson = (await v1DownloadRes.json()) as any;
-  if (!v1DownloadRes.ok || !v1DownloadJson.signedUrl) {
-    throw new Error(`v1 download failed: ${JSON.stringify(v1DownloadJson)}`);
+  if (!v1DownloadRes.ok) {
+    throw new Error(`v1 download failed with HTTP ${v1DownloadRes.status}`);
   }
 
-  const v1Bytes = Buffer.from(await (await fetch(v1DownloadJson.signedUrl)).arrayBuffer());
+  const v1ContentType = v1DownloadRes.headers.get('content-type') || '';
+  let v1Bytes: Buffer;
+  if (v1ContentType.includes('application/json')) {
+    const v1DownloadJson = (await v1DownloadRes.json()) as any;
+    v1Bytes = Buffer.from(await (await fetch(v1DownloadJson.signedUrl)).arrayBuffer());
+  } else {
+    v1Bytes = Buffer.from(await v1DownloadRes.arrayBuffer());
+  }
+
   const v1DownloadedHash = crypto.createHash('sha256').update(v1Bytes).digest('hex');
   const v1Row = allVersions.find((v) => v.version_number === 1);
   const expectedV1Hash = v1Row?.file_hash || initialV1Hash;

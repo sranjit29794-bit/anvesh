@@ -5,6 +5,8 @@ import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { generateEmbedding, generateRAGAnswer, RetrievedChunk } from '../lib/aiService.js';
 import { anomalyService } from '../services/anomalyService.js';
 
+import { resolveUser, handleAuthError } from '../middleware/resolveUser.js';
+
 export const searchRouter = Router();
 
 /**
@@ -39,12 +41,7 @@ async function resolveCaseId(caseIdentifier: string): Promise<string> {
 searchRouter.post('/', async (req: Request, res: Response) => {
   try {
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authorization header with Bearer JWT is required.',
-      });
-    }
+    const { userId, userRole, userCaseIds } = await resolveUser(authHeader);
 
     const { query, case_id, match_count } = req.body;
     if (!query || typeof query !== 'string' || query.trim().length === 0) {
@@ -53,18 +50,6 @@ searchRouter.post('/', async (req: Request, res: Response) => {
         error: 'Query parameter is required and cannot be empty.',
       });
     }
-
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-
-    if (userError || !userData?.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or expired authentication session.',
-      });
-    }
-
-    const userId = userData.user.id;
 
     // Resolve filter_case_id if provided
     let filterCaseUuid: string | null = null;
@@ -80,6 +65,7 @@ searchRouter.post('/', async (req: Request, res: Response) => {
     // WHERE case_id in (user's assigned cases OR shared docs) AND clearance allows sensitivity
     const limitCount = typeof match_count === 'number' && match_count > 0 ? Math.min(match_count, 20) : 8;
 
+    const userClient = createUserClient(authHeader!);
     const { data: chunks, error: rpcError } = await userClient.rpc('match_document_chunks', {
       query_embedding: queryEmbedding,
       match_count: limitCount,
@@ -94,13 +80,58 @@ searchRouter.post('/', async (req: Request, res: Response) => {
       });
     }
 
-    const retrievedChunks: RetrievedChunk[] = chunks || [];
+    let retrievedChunks: RetrievedChunk[] = chunks || [];
+
+    // Application-level attenuation filter (defense-in-depth)
+    // The RPC (match_document_chunks) already enforces document status visibility at the SQL layer,
+    // but we add an application-level check to ensure REJECTED documents never enter RAG context.
+    // PENDING_REVIEW documents of other officers are also filtered out here.
+    if (retrievedChunks.length > 0) {
+      const docIds = [...new Set(retrievedChunks.map((c: any) => c.document_id))];
+      const { data: docStatuses } = await supabaseAdmin
+        .from('documents')
+        .select('id, status, uploaded_by')
+        .in('id', docIds);
+
+      const blockedDocIds = new Set<string>();
+      for (const ds of docStatuses || []) {
+        if (ds.status === 'REJECTED') {
+          blockedDocIds.add(ds.id);
+        } else if (ds.status === 'PENDING_REVIEW' && ds.uploaded_by !== userId) {
+          if (userRole !== 'SUPERVISOR' && userRole !== 'ADMIN') {
+            blockedDocIds.add(ds.id);
+          }
+        }
+      }
+
+      if (blockedDocIds.size > 0) {
+        retrievedChunks = retrievedChunks.filter((c: any) => !blockedDocIds.has(c.document_id));
+      }
+    }
 
     // Step 3: Synthesize intelligence response strictly from retrieved chunks
-    const ragResult = await generateRAGAnswer(query, retrievedChunks);
+    let ragResult: {
+      answer: string;
+      citations: any[];
+      cited_doc_ids: string[];
+      chunks_used_count: number;
+      citation_hallucinated: boolean;
+    };
+
+    if (retrievedChunks.length === 0) {
+      ragResult = {
+        answer: 'No authorized document chunks found matching your query.',
+        citations: [],
+        cited_doc_ids: [],
+        chunks_used_count: 0,
+        citation_hallucinated: false,
+      };
+    } else {
+      ragResult = await generateRAGAnswer(query, retrievedChunks);
+    }
 
     // Step 4: Record search event in audit log (rule-immutable-audit-log)
-    const { error: auditError } = await userClient.from('audit_log').insert({
+    const { error: auditError } = await supabaseAdmin.from('audit_log').insert({
       user_id: userId,
       action: 'search',
       resource_type: 'document',
@@ -140,6 +171,7 @@ searchRouter.post('/', async (req: Request, res: Response) => {
       query_timestamp: new Date().toISOString(),
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Search] Unhandled search error:', err);
     return res.status(500).json({
       success: false,

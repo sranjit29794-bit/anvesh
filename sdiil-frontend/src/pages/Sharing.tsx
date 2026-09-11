@@ -30,8 +30,12 @@ export const Sharing: React.FC<SharingPageProps> = () => {
   const loadData = async () => {
     setIsLoading(true);
     try {
-      const approvals = await sharingService.getPendingApprovals();
-      setPendingApprovals(approvals);
+      if (user?.role === 'SUPERVISOR' || user?.role === 'ADMIN') {
+        const approvals = await sharingService.getPendingApprovals();
+        setPendingApprovals(approvals);
+      } else {
+        setPendingApprovals([]);
+      }
 
       const history = await sharingService.getSharingHistory();
       setReceipts(history);

@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { LogOut, Bell, Shield, User as UserIcon, Sun, Moon } from 'lucide-react';
+import { LogOut, Bell, Shield, User as UserIcon, Sun, Moon, Clock } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { useTheme } from '@/context/ThemeContext';
-import { UserRole } from '@/types/auth.types';
 import { SensitivityBadge } from '@/components/ui/SensitivityBadge';
+import { supabase } from '@/services/supabase.client';
 import { sharingService } from '@/services/sharing.service';
 
 export interface TopbarProps {
@@ -11,34 +11,44 @@ export interface TopbarProps {
   navigate: (route: string) => void;
 }
 
-export const Topbar: React.FC<TopbarProps> = ({ onOpenNotifications, navigate }) => {
-  const { user, logout, switchRole } = useAuth();
+export const Topbar: React.FC<TopbarProps> = ({ onOpenNotifications: _onOpenNotifications, navigate }) => {
+  const { user, logout } = useAuth();
   const { theme, toggleTheme } = useTheme();
-  const [pendingCount, setPendingCount] = useState<number>(0);
+  const [pendingSharingCount, setPendingSharingCount] = useState<number>(0);
+  const [pendingDocCount, setPendingDocCount] = useState<number>(0);
+  const [showNotificationMenu, setShowNotificationMenu] = useState<boolean>(false);
 
   useEffect(() => {
     const checkPending = async () => {
       if (user?.role === 'SUPERVISOR' || user?.role === 'ADMIN') {
-        const approvals = await sharingService.getPendingApprovals();
-        setPendingCount(approvals.length);
+        try {
+          const approvals = await sharingService.getPendingApprovals();
+          setPendingSharingCount(approvals?.length || 0);
+        } catch {
+          setPendingSharingCount(0);
+        }
+
+        try {
+          const { count } = await supabase
+            .from('documents')
+            .select('*', { count: 'exact', head: true })
+            .eq('status', 'PENDING_REVIEW');
+          setPendingDocCount(count || 0);
+        } catch {
+          setPendingDocCount(0);
+        }
       } else {
-        setPendingCount(0);
+        setPendingSharingCount(0);
+        setPendingDocCount(0);
       }
     };
+
     checkPending();
     const interval = setInterval(checkPending, 8000);
     return () => clearInterval(interval);
   }, [user]);
 
-  const roles: UserRole[] = [
-    'INVESTIGATOR',
-    'SUPERVISOR',
-    'ADMIN',
-    'PROSECUTOR',
-    'FORENSIC_OFFICER',
-    'COURT_REGISTRAR',
-    'REVIEWER',
-  ];
+  const totalNotifications = pendingSharingCount + pendingDocCount;
 
   return (
     <header className="h-topbar bg-bg-secondary border-b border-border px-4 sm:px-6 flex items-center justify-between z-20 shrink-0">
@@ -59,45 +69,103 @@ export const Topbar: React.FC<TopbarProps> = ({ onOpenNotifications, navigate })
         )}
       </div>
 
-      {/* Right: Role Switcher Simulation + User info + Notifications + Logout */}
+      {/* Right: User Role Badge + User info + Notifications + Logout */}
       <div className="flex items-center gap-3 sm:gap-4">
-        {/* Rapid Testing Role Switcher */}
+        {/* Read-Only Role Badge */}
         {user && (
-          <div className="flex items-center gap-1.5 bg-bg-card border border-border px-2 py-1 rounded-btn text-xs">
+          <div className="flex items-center gap-1.5 bg-bg-card border border-border px-2.5 py-1 rounded-btn text-xs">
             <Shield className="w-3.5 h-3.5 text-accent-primary shrink-0 hidden sm:inline" />
             <span className="text-text-muted text-[11px] hidden sm:inline font-mono uppercase">Role:</span>
-            <select
-              aria-label="Switch Role Simulation"
-              value={user.role}
-              onChange={(e) => switchRole(e.target.value as UserRole)}
-              className="bg-transparent text-text-primary text-xs font-medium outline-none cursor-pointer"
-            >
-              {roles.map((r) => (
-                <option key={r} value={r} className="bg-bg-card text-text-primary">
-                  {r}
-                </option>
-              ))}
-            </select>
+            <span className="px-1.5 py-0.5 rounded text-[11px] font-semibold bg-accent-primary/10 text-accent-primary border border-accent-primary/30">
+              {user.role}
+            </span>
           </div>
         )}
 
-        {/* Pending Dual-Auth Approvals notification for Supervisor/Admin */}
+        {/* Pending Reviews & Approvals notification for Supervisor/Admin */}
         {(user?.role === 'SUPERVISOR' || user?.role === 'ADMIN') && (
-          <button
-            onClick={() => {
-              if (onOpenNotifications) onOpenNotifications();
-              else navigate('/sharing');
-            }}
-            className="relative p-2 text-text-secondary hover:text-text-primary hover:bg-bg-elevated rounded-btn transition-colors"
-            title="Pending Dual-Auth Approvals"
-          >
-            <Bell className="w-4 h-4" />
-            {pendingCount > 0 && (
-              <span className="absolute -top-0.5 -right-0.5 w-4 h-4 bg-accent-danger text-white rounded-full text-[10px] font-bold flex items-center justify-center animate-bounce">
-                {pendingCount}
-              </span>
+          <div className="relative">
+            <button
+              onClick={() => setShowNotificationMenu((prev) => !prev)}
+              className="relative p-2 text-text-secondary hover:text-text-primary hover:bg-bg-elevated rounded-btn transition-colors cursor-pointer"
+              title={
+                pendingDocCount > 0
+                  ? `${pendingDocCount} documents awaiting your review`
+                  : pendingSharingCount > 0
+                  ? `${pendingSharingCount} pending dual-auth requests`
+                  : 'Notifications'
+              }
+            >
+              <Bell className="w-4 h-4" />
+              {totalNotifications > 0 && (
+                <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 bg-accent-danger text-white rounded-full text-[10px] font-bold flex items-center justify-center animate-bounce shadow-sm">
+                  {totalNotifications}
+                </span>
+              )}
+            </button>
+
+            {/* Notification Dropdown */}
+            {showNotificationMenu && (
+              <div className="absolute right-0 mt-2 w-80 bg-bg-card border border-border rounded-modal shadow-modal p-3 z-50 space-y-2 animate-in fade-in zoom-in-95 duration-150">
+                <div className="flex items-center justify-between pb-2 border-b border-border text-xs font-semibold text-text-primary">
+                  <span>Supervisor Alerts</span>
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-accent-primary/10 text-accent-primary">
+                    {totalNotifications} Active
+                  </span>
+                </div>
+
+                {totalNotifications === 0 ? (
+                  <p className="text-xs text-text-muted py-2 text-center">
+                    All reviews and approvals are up to date.
+                  </p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {pendingDocCount > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowNotificationMenu(false);
+                          navigate('/cases');
+                        }}
+                        className="w-full text-left p-2.5 rounded-btn bg-[#F5A623]/10 hover:bg-[#F5A623]/20 border border-[#F5A623]/30 transition-colors flex items-start gap-2.5 cursor-pointer"
+                      >
+                        <Clock className="w-4 h-4 text-[#F5A623] shrink-0 mt-0.5" />
+                        <div>
+                          <p className="text-xs font-semibold text-[#F5A623]">
+                            {pendingDocCount} documents awaiting your review
+                          </p>
+                          <p className="text-[11px] text-text-muted mt-0.5">
+                            Click to inspect case documents awaiting supervisor attestation
+                          </p>
+                        </div>
+                      </button>
+                    )}
+
+                    {pendingSharingCount > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowNotificationMenu(false);
+                          navigate('/sharing');
+                        }}
+                        className="w-full text-left p-2.5 rounded-btn bg-accent-primary/10 hover:bg-accent-primary/20 border border-accent-primary/30 transition-colors flex items-start gap-2.5 cursor-pointer"
+                      >
+                        <Shield className="w-4 h-4 text-accent-primary shrink-0 mt-0.5" />
+                        <div>
+                          <p className="text-xs font-semibold text-accent-primary">
+                            {pendingSharingCount} dual-auth sharing requests
+                          </p>
+                          <p className="text-[11px] text-text-muted mt-0.5">
+                            Pending Sensitivity-A cross-agency authorizations
+                          </p>
+                        </div>
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
-          </button>
+          </div>
         )}
 
         {/* Light/Dark Theme Toggle Button (32x32px, transparent bg, hover bg-bg-elevated, radius 6px) */}

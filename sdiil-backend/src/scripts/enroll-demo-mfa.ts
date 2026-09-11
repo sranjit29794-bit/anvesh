@@ -29,10 +29,13 @@ if (!resolvedAnonKey) {
 }
 
 const DEMO_USERS = [
-  { email: 'officer.demo@sdiil.test', password: 'Demo@Officer123', role: 'officer', name: 'Insp. Vikram Rathore' },
-  { email: 'supervisor.demo@sdiil.test', password: 'Demo@Supervisor123', role: 'supervisor', name: 'SP Sunita Sharma' },
-  { email: 'admin.demo@sdiil.test', password: 'Demo@Admin123', role: 'admin', name: 'System Administrator' },
-  { email: 'judge.demo@sdiil.test', password: 'Demo@Judge123', role: 'judge', name: 'Hon. Justice Rajesh Verma' },
+  { email: 'admin.demo@sdiil.test', password: 'Demo@Admin123', role: 'ADMIN', name: 'System Administrator' },
+  { email: 'supervisor.demo@sdiil.test', password: 'Demo@Supervisor123', role: 'SUPERVISOR', name: 'SP Sunita Sharma' },
+  { email: 'officer.demo@sdiil.test', password: 'Demo@Officer123', role: 'INVESTIGATOR', name: 'Insp. Vikram Rathore' },
+  { email: 'prosecutor.demo@sdiil.test', password: 'Demo@Prosecutor123', role: 'PROSECUTOR', name: 'Adv. Meera Sen' },
+  { email: 'judge.demo@sdiil.test', password: 'Demo@Judge123', role: 'JUDGE', name: 'Hon. Justice Rajesh Verma' },
+  { email: 'forensic.demo@sdiil.test', password: 'Demo@Forensic123', role: 'FORENSIC_OFFICER', name: 'Dr. Subhash Bose' },
+  { email: 'registrar.demo@sdiil.test', password: 'Demo@Registrar123', role: 'COURT_REGISTRAR', name: 'Sh. Alok Mathur' },
 ];
 
 /**

@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
-import { createUserClient } from '../lib/supabaseUser.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
+import { resolveUser, handleAuthError } from '../middleware/resolveUser.js';
 
 export const auditRouter = Router();
 
@@ -100,35 +100,10 @@ function buildHumanReadableDescription(row: any): string {
  */
 auditRouter.get('/', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Authorization header with Bearer JWT required.' });
-    }
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
 
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-    if (userError || !userData?.user) {
-      return res.status(401).json({ success: false, error: 'Invalid or expired session.' });
-    }
-
-    const userId = userData.user.id;
-
-    // Check caller profile & role
-    const { data: profile } = await userClient
-      .from('profiles')
-      .select('role, name')
-      .eq('id', userId)
-      .single();
-
-    const isPrivileged = profile?.role === 'admin' || profile?.role === 'supervisor';
-
-    // Retrieve caller's assigned cases
-    const { data: assignments } = await userClient
-      .from('case_assignments')
-      .select('case_id')
-      .eq('user_id', userId);
-
-    const assignedCaseIds = (assignments || []).map((a: any) => a.case_id);
+    const isPrivileged = userRole === 'ADMIN' || userRole === 'SUPERVISOR';
+    const assignedCaseIds = userCaseIds;
 
     // Parse filters
     const {
@@ -157,8 +132,8 @@ auditRouter.get('/', async (req: Request, res: Response) => {
       }
     }
 
-    // Build base query under RLS
-    let query = userClient
+    // Build base query
+    let query = supabaseAdmin
       .from('audit_log')
       .select(
         `
@@ -263,6 +238,7 @@ auditRouter.get('/', async (req: Request, res: Response) => {
       offset,
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Audit API] Error:', err);
     return res.status(500).json({ success: false, error: err?.message || 'Failed to retrieve audit trail.' });
   }

@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
-import { createUserClient } from '../lib/supabaseUser.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
+import { resolveUser, handleAuthError } from '../middleware/resolveUser.js';
 import { anomalyService } from '../services/anomalyService.js';
 
 export const anomaliesRouter = Router();
@@ -8,32 +8,15 @@ export const anomaliesRouter = Router();
 /**
  * GET /api/v1/anomalies
  * Returns all unacknowledged anomaly_flags rows ordered by triggered_at descending.
- * Enforces RLS via createUserClient:
  * - ADMIN & SUPERVISOR get all rows across all cases.
  * - Officers and Judges get only rows for their assigned cases.
  */
 anomaliesRouter.get('/', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authorization header with Bearer JWT is required.',
-      });
-    }
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
 
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userErr } = await userClient.auth.getUser();
-
-    if (userErr || !userData?.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or expired authentication session.',
-      });
-    }
-
-    // Query anomaly_flags under RLS
-    const { data: anomalies, error: anomaliesErr } = await userClient
+    // Query anomaly_flags using supabaseAdmin
+    let query = supabaseAdmin
       .from('anomaly_flags')
       .select(`
         id,
@@ -51,6 +34,17 @@ anomaliesRouter.get('/', async (req: Request, res: Response) => {
       .eq('acknowledged', false)
       .order('triggered_at', { ascending: false });
 
+    // Non-supervisor/admin only see flags for their assigned cases or triggered by them
+    if (userRole !== 'ADMIN' && userRole !== 'SUPERVISOR') {
+      if (userCaseIds.length > 0) {
+        query = query.or(`case_id.in.(${userCaseIds.join(',')}),user_id.eq.${userId}`);
+      } else {
+        query = query.eq('user_id', userId);
+      }
+    }
+
+    const { data: anomalies, error: anomaliesErr } = await query;
+
     if (anomaliesErr) {
       console.error('[Anomalies API] Query error:', anomaliesErr);
       return res.status(500).json({
@@ -59,11 +53,11 @@ anomaliesRouter.get('/', async (req: Request, res: Response) => {
       });
     }
 
-    // Enrich with user profile info and case details if available
+    // Enrich with user profile info
     const userIds = Array.from(new Set((anomalies || []).map((a) => a.user_id).filter(Boolean)));
     const { data: profiles } = await supabaseAdmin
       .from('profiles')
-      .select('id, username, full_name, role')
+      .select('id, name, role')
       .in('id', userIds);
 
     const profileMap = new Map<string, any>();
@@ -78,8 +72,8 @@ anomaliesRouter.get('/', async (req: Request, res: Response) => {
       return {
         ...a,
         user: p
-          ? { id: p.id, username: p.username, full_name: p.full_name, role: p.role }
-          : { id: a.user_id, username: 'Unknown', full_name: 'Unknown User', role: 'officer' },
+          ? { id: p.id, username: p.name, full_name: p.name, role: (p.role || 'OFFICER').toUpperCase() }
+          : { id: a.user_id, username: 'Unknown', full_name: 'Unknown User', role: 'OFFICER' },
       };
     });
 
@@ -89,6 +83,7 @@ anomaliesRouter.get('/', async (req: Request, res: Response) => {
       count: enriched.length,
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Anomalies API] Unhandled error in GET /:', err);
     return res.status(500).json({
       success: false,
@@ -100,33 +95,25 @@ anomaliesRouter.get('/', async (req: Request, res: Response) => {
 /**
  * GET /api/v1/anomalies/stats
  * Returns counts grouped by severity and rule_triggered for dashboard stat cards.
- * Enforces the same RLS scoping.
  */
 anomaliesRouter.get('/stats', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authorization header with Bearer JWT is required.',
-      });
-    }
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
 
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userErr } = await userClient.auth.getUser();
-
-    if (userErr || !userData?.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or expired authentication session.',
-      });
-    }
-
-    // Query unacknowledged anomaly flags under RLS
-    const { data: rows, error } = await userClient
+    let query = supabaseAdmin
       .from('anomaly_flags')
       .select('severity, rule_triggered')
       .eq('acknowledged', false);
+
+    if (userRole !== 'ADMIN' && userRole !== 'SUPERVISOR') {
+      if (userCaseIds.length > 0) {
+        query = query.or(`case_id.in.(${userCaseIds.join(',')}),user_id.eq.${userId}`);
+      } else {
+        query = query.eq('user_id', userId);
+      }
+    }
+
+    const { data: rows, error } = await query;
 
     if (error) {
       return res.status(500).json({
@@ -159,6 +146,7 @@ anomaliesRouter.get('/stats', async (req: Request, res: Response) => {
       by_rule: byRule,
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Anomalies API] Stats error:', err);
     return res.status(500).json({
       success: false,
@@ -174,35 +162,9 @@ anomaliesRouter.get('/stats', async (req: Request, res: Response) => {
  */
 anomaliesRouter.patch('/:id/acknowledge', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authorization header with Bearer JWT is required.',
-      });
-    }
+    const { userId, userRole } = await resolveUser(req.headers.authorization);
 
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userErr } = await userClient.auth.getUser();
-
-    if (userErr || !userData?.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or expired authentication session.',
-      });
-    }
-
-    const userId = userData.user.id;
-
-    // Check caller role
-    const { data: profile } = await supabaseAdmin
-      .from('profiles')
-      .select('role')
-      .eq('id', userId)
-      .maybeSingle();
-
-    const role = (profile?.role || '').toLowerCase();
-    if (role !== 'admin' && role !== 'supervisor') {
+    if (userRole !== 'ADMIN' && userRole !== 'SUPERVISOR') {
       return res.status(403).json({
         success: false,
         error: 'Access denied: Only ADMIN and SUPERVISOR roles may acknowledge security anomalies.',
@@ -251,6 +213,7 @@ anomaliesRouter.patch('/:id/acknowledge', async (req: Request, res: Response) =>
       message: 'Anomaly successfully acknowledged.',
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Anomalies API] Acknowledge error:', err);
     return res.status(500).json({
       success: false,
@@ -267,35 +230,9 @@ anomaliesRouter.patch('/:id/acknowledge', async (req: Request, res: Response) =>
  */
 anomaliesRouter.post('/demo-trigger', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authorization header with Bearer JWT is required.',
-      });
-    }
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
 
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userErr } = await userClient.auth.getUser();
-
-    if (userErr || !userData?.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or expired authentication session.',
-      });
-    }
-
-    const userId = userData.user.id;
-
-    // Check caller role
-    const { data: profile } = await supabaseAdmin
-      .from('profiles')
-      .select('role')
-      .eq('id', userId)
-      .maybeSingle();
-
-    const role = (profile?.role || '').toLowerCase();
-    if (role !== 'admin' && role !== 'supervisor') {
+    if (userRole !== 'ADMIN' && userRole !== 'SUPERVISOR') {
       return res.status(403).json({
         success: false,
         error: 'Access denied: Only ADMIN and SUPERVISOR roles may trigger demo anomalies.',
@@ -304,17 +241,10 @@ anomaliesRouter.post('/demo-trigger', async (req: Request, res: Response) => {
 
     // Resolve an assigned case for this user
     let targetCaseId: string | null = null;
-    const { data: assignment } = await supabaseAdmin
-      .from('case_assignments')
-      .select('case_id')
-      .eq('user_id', userId)
-      .limit(1)
-      .maybeSingle();
-
-    if (assignment?.case_id) {
-      targetCaseId = assignment.case_id;
+    if (userCaseIds.length > 0) {
+      targetCaseId = userCaseIds[0];
     } else {
-      // Default to first case if admin has no explicit direct assignment row
+      // Default to first case if user has no explicit direct assignment row
       const { data: anyCase } = await supabaseAdmin.from('cases').select('id').limit(1).single();
       targetCaseId = anyCase?.id || '8909e909-0869-4e0b-9b38-67c64c80891b';
     }
@@ -375,6 +305,7 @@ anomaliesRouter.post('/demo-trigger', async (req: Request, res: Response) => {
       case_id: targetCaseId,
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Anomalies API] Demo trigger error:', err);
     return res.status(500).json({
       success: false,

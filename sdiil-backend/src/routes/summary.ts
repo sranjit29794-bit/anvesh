@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { createUserClient } from '../lib/supabaseUser.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
+import { resolveUser, handleAuthError } from '../middleware/resolveUser.js';
 
 export const summaryRouter = Router();
 
@@ -44,19 +44,17 @@ export interface StructuredCaseSummary {
 async function synthesizeWithGemini(prompt: string, apiKey: string): Promise<string> {
   const genAI = new GoogleGenerativeAI(apiKey);
   const models = [
-    'gemini-flash-latest',
-    'gemini-3.6-flash',
     'gemini-1.5-flash',
-    'gemini-2.0-flash-exp',
-    'gemini-3.7-flash',
+    'gemini-2.0-flash',
+    'gemini-1.5-pro',
   ];
 
   let lastError: any = null;
 
   for (const modelName of models) {
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        console.log(`[Gemini] Attempting model "${modelName}" (attempt ${attempt}/3)...`);
+        console.log(`[Gemini] Attempting model "${modelName}" (attempt ${attempt}/2)...`);
         const model = genAI.getGenerativeModel({
           model: modelName,
           generationConfig: {
@@ -74,7 +72,7 @@ async function synthesizeWithGemini(prompt: string, apiKey: string): Promise<str
         const msg = err.message || '';
         console.log(`[Gemini] Model "${modelName}" error:`, err.status || msg.slice(0, 100));
         if (msg.includes('503') || msg.includes('429') || msg.includes('overloaded') || msg.includes('high demand')) {
-          await new Promise((resolve) => setTimeout(resolve, attempt * 1200));
+          await new Promise((resolve) => setTimeout(resolve, attempt * 600));
         } else {
           // If 404 or unsupported, move directly to next model
           break;
@@ -136,48 +134,237 @@ function buildDeterministicSummary(
 }
 
 /**
- * GET /api/v1/cases/:caseId
- * Fetch case details if assigned or caller is ADMIN/SUPERVISOR.
+ * GET /api/v1/cases
+ * FIX C: Returns cases assigned to caller (or all cases if ADMIN/SUPERVISOR).
+ * Uses resolveUser to extract userCaseIds directly from case_assignments.
  */
-summaryRouter.get('/:caseId', async (req: Request, res: Response) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ success: false, error: 'Authorization header with Bearer JWT is required.' });
-  }
-
+summaryRouter.get('/', async (req: Request, res: Response) => {
   try {
-    const { caseId } = req.params;
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-    if (userError || !userData?.user) {
-      return res.status(401).json({ success: false, error: 'Invalid or expired session.' });
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
+    const isPrivileged = userRole === 'SUPERVISOR' || userRole === 'ADMIN';
+
+    // If user has no assigned cases and is not privileged, return 200 with empty array
+    if (!isPrivileged && userCaseIds.length === 0) {
+      return res.status(200).json({ success: true, cases: [], data: [] });
     }
 
-    const userId = userData.user.id;
+    let casesQuery = supabaseAdmin
+      .from('cases')
+      .select('id, case_number, title, status, created_by, created_at');
+
+    if (!isPrivileged) {
+      casesQuery = casesQuery.in('id', userCaseIds);
+    }
+
+    const { data: dbCases, error: casesErr } = await casesQuery.order('created_at', { ascending: false });
+    if (casesErr) {
+      console.error('[Cases List] Error querying cases:', casesErr.message);
+      return res.status(500).json({ success: false, error: casesErr.message });
+    }
+
+    const caseUuids = (dbCases || []).map((c: any) => c.id);
+
+    // Fetch document counts
+    const { data: docCounts } = await supabaseAdmin
+      .from('documents')
+      .select('id, case_id, sensitivity_level, doc_type, status')
+      .in('case_id', caseUuids);
+
+    // Fetch assignment counts
+    const { data: assignCounts } = await supabaseAdmin
+      .from('case_assignments')
+      .select('case_id, user_id')
+      .in('case_id', caseUuids);
+
+    const result = (dbCases || []).map((c: any) => {
+      const caseDocs = (docCounts || []).filter((d: any) => d.case_id === c.id);
+      const caseAssigns = (assignCounts || []).filter((a: any) => a.case_id === c.id);
+
+      const totalDocs = caseDocs.length;
+      const activeDocs = caseDocs.filter((d: any) => (d.status || 'ACTIVE') === 'ACTIVE').length;
+      const sensA = caseDocs.filter((d: any) => d.sensitivity_level === 'A').length;
+      const sensB = caseDocs.filter((d: any) => d.sensitivity_level === 'B').length;
+      const sensC = caseDocs.filter((d: any) => d.sensitivity_level === 'C').length;
+
+      return {
+        id: c.id,
+        case_id: c.id,
+        case_number: c.case_number,
+        title: c.title,
+        status: c.status === 'closed' ? 'CLOSED' : 'UNDER_INVESTIGATION',
+        police_station: c.police_station || 'Hinjawadi Police Station',
+        department: 'ICJS Node: Maharashtra Special Cell',
+        created_at: c.created_at,
+        updated_at: c.updated_at,
+        document_count: totalDocs,
+        active_document_count: activeDocs,
+        assigned_user_count: caseAssigns.length,
+        document_counts: {
+          total: totalDocs,
+          active: activeDocs,
+          sensitivity_a: sensA,
+          sensitivity_b: sensB,
+          sensitivity_c: sensC,
+          by_type: {},
+        },
+        assigned_members: caseAssigns.map((a: any) => a.user_id),
+      };
+    });
+
+    return res.status(200).json({ success: true, cases: result, data: result });
+  } catch (err: any) {
+    if (handleAuthError(res, err)) return;
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to list cases' });
+  }
+});
+
+/**
+ * GET /api/v1/cases/:caseId/documents
+ * FIX D: Lists documents for a specific case with role-based attestation filtering.
+ */
+summaryRouter.get('/:caseId/documents', async (req: Request, res: Response) => {
+  try {
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
+    const { caseId } = req.params;
     const caseUuid = await resolveCaseUuid(caseId);
     if (!caseUuid) {
       return res.status(404).json({ success: false, error: `Case not found: ${caseId}` });
     }
 
-    // Check caller role
-    const { data: profile } = await supabaseAdmin.from('profiles').select('role').eq('id', userId).maybeSingle();
-    const isPrivileged = profile?.role === 'admin' || profile?.role === 'supervisor';
+    const isPrivileged = userRole === 'SUPERVISOR' || userRole === 'ADMIN';
+    if (!isPrivileged && !userCaseIds.includes(caseUuid)) {
+      return res.status(403).json({ success: false, error: 'Access denied: You are not assigned to this case.' });
+    }
 
-    // Check assignment if not privileged
-    if (!isPrivileged) {
-      const { data: assignment } = await supabaseAdmin
-        .from('case_assignments')
-        .select('id')
-        .eq('case_id', caseUuid)
-        .eq('user_id', userId)
-        .maybeSingle();
+    const { data: docs, error: docErr } = await supabaseAdmin
+      .from('documents')
+      .select(`
+        id,
+        case_id,
+        title,
+        doc_type,
+        sensitivity_level,
+        mime_type,
+        status,
+        reviewed_by,
+        reviewed_at,
+        review_note,
+        current_version_id,
+        uploaded_by,
+        created_at,
+        reviewer:profiles!reviewed_by (
+          id,
+          name,
+          role
+        ),
+        document_versions!fk_current_version (
+          id,
+          version_number,
+          storage_path,
+          file_hash,
+          file_size_bytes
+        )
+      `)
+      .eq('case_id', caseUuid)
+      .order('created_at', { ascending: false });
 
-      if (!assignment) {
-        return res.status(403).json({
-          success: false,
-          error: 'Access denied: You are not assigned to this case.',
-        });
+    if (docErr) {
+      return res.status(500).json({ success: false, error: docErr.message });
+    }
+
+    // Role-based attestation status filter (FIX D):
+    // SUPERVISOR, ADMIN: see all statuses
+    // INVESTIGATOR / OFFICER: sees ACTIVE + own PENDING_REVIEW + own REJECTED
+    // All other roles: ACTIVE only
+    const filteredDocs = (docs || []).filter((doc: any) => {
+      const docStatus = doc.status || 'ACTIVE';
+      if (isPrivileged) return true;
+      if (userRole === 'INVESTIGATOR' || userRole === 'OFFICER') {
+        return docStatus === 'ACTIVE' || doc.uploaded_by === userId;
       }
+      return docStatus === 'ACTIVE';
+    });
+
+    // Part 2: Validate real storage presence for each document
+    const documents: any[] = [];
+    const documents_missing_files: any[] = [];
+
+    await Promise.all(
+      filteredDocs.map(async (doc: any) => {
+        const versions = Array.isArray(doc.document_versions)
+          ? doc.document_versions
+          : doc.document_versions ? [doc.document_versions] : [];
+        const curVer = versions.find((v: any) => v.id === doc.current_version_id) || versions[0];
+        const storagePath = curVer?.storage_path || null;
+
+        const docRecord = {
+          ...doc,
+          file_id: doc.id,
+          minio_path: storagePath || '',
+          storage_path: storagePath,
+          version: curVer?.version_number || 1,
+          original_hash: curVer?.file_hash || '',
+          computed_hash: curVer?.file_hash || '',
+          file_size_bytes: curVer?.file_size_bytes || 0,
+        };
+
+        if (!storagePath) {
+          documents_missing_files.push(docRecord);
+          return;
+        }
+
+        try {
+          const { data: signedData, error: signErr } = await supabaseAdmin.storage
+            .from('case-documents')
+            .createSignedUrl(storagePath, 3600);
+
+          if (signErr || !signedData?.signedUrl) {
+            documents_missing_files.push(docRecord);
+          } else {
+            documents.push({
+              ...docRecord,
+              signedUrl: signedData.signedUrl,
+              url: signedData.signedUrl,
+            });
+          }
+        } catch {
+          documents_missing_files.push(docRecord);
+        }
+      })
+    );
+
+    return res.status(200).json({
+      success: true,
+      documents,
+      documents_missing_files,
+      data: documents,
+      count: documents.length,
+    });
+  } catch (err: any) {
+    if (handleAuthError(res, err)) return;
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to list case documents' });
+  }
+});
+
+/**
+ * GET /api/v1/cases/:caseId
+ * Fetch case details if assigned or caller is ADMIN/SUPERVISOR.
+ */
+summaryRouter.get('/:caseId', async (req: Request, res: Response) => {
+  try {
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
+    const { caseId } = req.params;
+    const caseUuid = await resolveCaseUuid(caseId);
+    if (!caseUuid) {
+      return res.status(404).json({ success: false, error: `Case not found: ${caseId}` });
+    }
+
+    const isPrivileged = userRole === 'SUPERVISOR' || userRole === 'ADMIN';
+    if (!isPrivileged && !userCaseIds.includes(caseUuid)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied: You are not assigned to this case.',
+      });
     }
 
     const { data: caseRow, error: caseErr } = await supabaseAdmin
@@ -190,8 +377,9 @@ summaryRouter.get('/:caseId', async (req: Request, res: Response) => {
       return res.status(404).json({ success: false, error: 'Case not found.' });
     }
 
-    return res.status(200).json({ success: true, case: caseRow });
+    return res.status(200).json({ success: true, case: caseRow, data: caseRow });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     return res.status(500).json({ success: false, error: err?.message || 'Internal server error.' });
   }
 });
@@ -203,15 +391,7 @@ summaryRouter.get('/:caseId', async (req: Request, res: Response) => {
 summaryRouter.post('/:caseId/summary', async (req: Request, res: Response) => {
   console.log(`[Case Summary API] POST /cases/${req.params.caseId}/summary received`);
   try {
-    // Step 1: Validate caller's Bearer JWT
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authorization header with Bearer JWT is required.',
-      });
-    }
-
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
     const { caseId } = req.params;
     if (!caseId) {
       return res.status(400).json({
@@ -220,19 +400,6 @@ summaryRouter.post('/:caseId/summary', async (req: Request, res: Response) => {
       });
     }
 
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-
-    if (userError || !userData?.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or expired authentication session.',
-      });
-    }
-
-    const userId = userData.user.id;
-
-    // Resolve Case UUID
     const caseUuid = await resolveCaseUuid(caseId);
     if (!caseUuid) {
       return res.status(404).json({
@@ -241,42 +408,27 @@ summaryRouter.post('/:caseId/summary', async (req: Request, res: Response) => {
       });
     }
 
-    // Check Case Assignment under RLS
-    const { data: assignment } = await userClient
-      .from('case_assignments')
-      .select('id')
-      .eq('case_id', caseUuid)
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    const { data: profile } = await userClient
-      .from('profiles')
-      .select('role')
-      .eq('id', userId)
-      .maybeSingle();
-
-    const userRole = (profile?.role || 'officer').toLowerCase();
-    const isPrivileged = userRole === 'admin' || userRole === 'supervisor';
-
-    if (!assignment && !isPrivileged) {
+    const isPrivileged = userRole === 'ADMIN' || userRole === 'SUPERVISOR';
+    if (!isPrivileged && !userCaseIds.includes(caseUuid)) {
       return res.status(403).json({
         success: false,
         error: 'Access denied: You are not assigned to this case.',
       });
     }
 
-    // Step 2: Derive allowed sensitivity levels from caller's role clearance
+    // Derive allowed sensitivity levels from caller's role clearance
+    const roleLower = userRole.toLowerCase();
     let allowedSensitivities = ['C'];
-    if (['admin', 'supervisor', 'officer', 'investigator', 'forensic_officer'].includes(userRole)) {
+    if (['admin', 'supervisor', 'officer', 'investigator', 'forensic_officer'].includes(roleLower)) {
       allowedSensitivities = ['A', 'B', 'C'];
-    } else if (['judge', 'prosecutor', 'reviewer'].includes(userRole)) {
+    } else if (['judge', 'prosecutor', 'reviewer'].includes(roleLower)) {
       allowedSensitivities = ['A', 'B', 'C'];
     } else {
       allowedSensitivities = ['C'];
     }
 
     // Fetch document_embeddings rows joining documents table
-    const { data: chunkRows, error: chunkErr } = await userClient
+    const { data: chunkRows, error: chunkErr } = await supabaseAdmin
       .from('document_embeddings')
       .select(`
         id,
@@ -287,7 +439,9 @@ summaryRouter.post('/:caseId/summary', async (req: Request, res: Response) => {
         documents!inner (
           id,
           title,
-          doc_type
+          doc_type,
+          status,
+          uploaded_by
         )
       `)
       .eq('case_id', caseUuid)
@@ -301,7 +455,21 @@ summaryRouter.post('/:caseId/summary', async (req: Request, res: Response) => {
       });
     }
 
-    const chunks = chunkRows || [];
+    const userRoleUpper = userRole.toUpperCase();
+    const chunks = (chunkRows || []).filter((row: any) => {
+      const doc = Array.isArray(row.documents) ? row.documents[0] : row.documents;
+      const docStatus = doc?.status || 'ACTIVE';
+      if (docStatus === 'REJECTED') {
+        return false;
+      }
+      if (['SUPERVISOR', 'ADMIN'].includes(userRoleUpper)) {
+        return true;
+      }
+      if (['INVESTIGATOR', 'OFFICER'].includes(userRoleUpper)) {
+        return docStatus === 'ACTIVE' || doc?.uploaded_by === userId;
+      }
+      return docStatus === 'ACTIVE';
+    });
 
     // Fallback if no authorized chunks exist for this case/clearance
     if (chunks.length === 0) {
@@ -471,7 +639,7 @@ ${promptChunksText}`;
     });
 
     // Step 5: Append to immutable audit log (rule-immutable-audit-log)
-    const { error: auditError } = await userClient.from('audit_log').insert({
+    const { error: auditError } = await supabaseAdmin.from('audit_log').insert({
       user_id: userId,
       action: 'case_summary',
       resource_type: 'case',
@@ -501,6 +669,7 @@ ${promptChunksText}`;
       generated_at: new Date().toISOString(),
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Case Summary] Unhandled error during synthesis:', err);
     return res.status(500).json({
       success: false,

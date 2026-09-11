@@ -288,7 +288,9 @@ export async function generateVerificationReportPdf(data: VerificationReportData
   });
 
   // Generate and embed QR code
-  const publicVerifyUrl = `https://icjs.delhi.gov.in/verify/${data.docId}/${data.computedHash.slice(0, 16)}`;
+  const baseUrl = process.env.PUBLIC_VERIFY_BASE_URL || 'https://sdiil-backend.onrender.com';
+  const hash = data.status === 'TAMPERED' ? data.computedHash : (data.registeredHash || data.computedHash);
+  const publicVerifyUrl = `${baseUrl}/verify/${data.docId}/${hash}`;
   try {
     const qrPngBuffer = await QRCode.toBuffer(publicVerifyUrl, {
       type: 'png',

@@ -6,15 +6,40 @@ import {
   DocumentUploadResponse,
   DocType,
   SensitivityLevel,
+  DocumentStatus,
   AnomalyAlert,
 } from '@/types/document.types';
 
 export const documentsService = {
   /**
    * List documents belonging to a case.
-   * Queries Supabase documents table under RLS, with seamless fallback/merge.
+   * Calls real backend /api/v1/cases/:caseId/documents with Bearer token, with Supabase fallback.
    */
   async getDocumentsByCase(caseId: string): Promise<DocumentRecord[]> {
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const token = session?.access_token;
+      const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
+
+      if (token) {
+        const res = await fetch(`${apiBase}/cases/${caseId}/documents`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+        if (res.ok) {
+          const json = await res.json();
+          if (json.documents && Array.isArray(json.documents)) {
+            return json.documents;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[documentsService] Backend /cases/:caseId/documents call notice:', err);
+    }
+
     try {
       let caseUuid = caseId;
       // If not a UUID (e.g. MH-PN-2026-0142), resolve UUID from cases table
@@ -35,9 +60,19 @@ export const documentsService = {
           title,
           doc_type,
           sensitivity_level,
+          mime_type,
+          status,
+          reviewed_by,
+          reviewed_at,
+          review_note,
           current_version_id,
           uploaded_by,
           created_at,
+          reviewer:profiles!reviewed_by (
+            id,
+            name,
+            role
+          ),
           document_versions!fk_current_version (
             id,
             version_number,
@@ -54,6 +89,7 @@ export const documentsService = {
             ? row.document_versions
             : row.document_versions ? [row.document_versions] : [];
           const curVersion = versions.find((v: any) => v.id === row.current_version_id) || versions[0];
+          const reviewerObj = Array.isArray(row.reviewer) ? row.reviewer[0] : row.reviewer;
 
           return {
             file_id: row.id,
@@ -63,6 +99,7 @@ export const documentsService = {
             title: row.title,
             doc_type: row.doc_type as DocType,
             sensitivity_level: row.sensitivity_level as SensitivityLevel,
+            mime_type: row.mime_type,
             original_hash: curVersion?.file_hash || '',
             computed_hash: curVersion?.file_hash || '',
             system_signature: `RSA2048-SIG-${row.id.slice(0, 8).toUpperCase()}`,
@@ -77,7 +114,11 @@ export const documentsService = {
             classification_confidence: 0.98,
             flags: { ocr_low_confidence: false, classification_needs_review: false },
             version: curVersion?.version_number || 1,
-            status: 'ACTIVE',
+            status: (row.status || 'ACTIVE') as DocumentStatus,
+            reviewed_by: row.reviewed_by,
+            reviewed_by_name: reviewerObj?.name || null,
+            reviewed_at: row.reviewed_at,
+            review_note: row.review_note,
             created_at: row.created_at,
             is_synthetic: false,
           };
@@ -102,6 +143,66 @@ export const documentsService = {
    */
   async getDocument(docId: string, _userId?: string, username?: string): Promise<DocumentRecord> {
     try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const token = session?.access_token;
+      const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
+
+      if (token) {
+        const res = await fetch(`${apiBase}/documents/${docId}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+        if (res.ok) {
+          const json = await res.json();
+          const row = json.document || json.data;
+          if (row) {
+            const versions = Array.isArray(row.document_versions)
+              ? row.document_versions
+              : row.document_versions ? [row.document_versions] : [];
+            const curVersion = versions.find((v: any) => v.id === row.current_version_id) || versions[0];
+            const reviewerObj = Array.isArray(row.reviewer) ? row.reviewer[0] : row.reviewer;
+
+            return {
+              file_id: row.id,
+              case_id: row.case_id,
+              uploader_id: row.uploaded_by,
+              uploader_name: username || 'Authorized Officer',
+              title: row.title,
+              doc_type: row.doc_type as DocType,
+              sensitivity_level: row.sensitivity_level as SensitivityLevel,
+              mime_type: row.mime_type,
+              original_hash: curVersion?.file_hash || '',
+              computed_hash: curVersion?.file_hash || '',
+              system_signature: `RSA2048-SIG-${row.id.slice(0, 8).toUpperCase()}`,
+              minio_path: curVersion?.storage_path || '',
+              ocr_text: row.ocr_text || `[OFFICIAL ICJS EVIDENCE RECORD]\nCase: ${row.case_id}\nDoc: ${row.title}`,
+              metadata: {
+                case_id_reference: row.case_id,
+                document_date: new Date(row.created_at).toLocaleDateString('en-GB'),
+                file_size_bytes: curVersion?.file_size_bytes || 0,
+                ai_extracted: true,
+              },
+              classification_confidence: 0.98,
+              flags: { ocr_low_confidence: false, classification_needs_review: false },
+              version: curVersion?.version_number || 1,
+              status: (row.status || 'ACTIVE') as DocumentStatus,
+              reviewed_by: row.reviewed_by,
+              reviewed_by_name: reviewerObj?.name || null,
+              reviewed_at: row.reviewed_at,
+              review_note: row.review_note,
+              created_at: row.created_at,
+              is_synthetic: false,
+            };
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[documentsService] Backend /documents/:id failed:', err);
+    }
+    try {
       const { data: row, error } = await supabase
         .from('documents')
         .select(`
@@ -110,9 +211,19 @@ export const documentsService = {
           title,
           doc_type,
           sensitivity_level,
+          mime_type,
+          status,
+          reviewed_by,
+          reviewed_at,
+          review_note,
           current_version_id,
           uploaded_by,
           created_at,
+          reviewer:profiles!reviewed_by (
+            id,
+            name,
+            role
+          ),
           document_versions!fk_current_version (
             id,
             version_number,
@@ -129,6 +240,7 @@ export const documentsService = {
           ? row.document_versions
           : row.document_versions ? [row.document_versions] : [];
         const curVersion = versions.find((v: any) => v.id === row.current_version_id) || versions[0];
+        const reviewerObj = Array.isArray(row.reviewer) ? row.reviewer[0] : row.reviewer;
 
         return {
           file_id: row.id,
@@ -138,6 +250,7 @@ export const documentsService = {
           title: row.title,
           doc_type: row.doc_type as DocType,
           sensitivity_level: row.sensitivity_level as SensitivityLevel,
+          mime_type: row.mime_type,
           original_hash: curVersion?.file_hash || '',
           computed_hash: curVersion?.file_hash || '',
           system_signature: `RSA2048-SIG-${row.id.slice(0, 8).toUpperCase()}`,
@@ -152,7 +265,11 @@ export const documentsService = {
           classification_confidence: 0.98,
           flags: { ocr_low_confidence: false, classification_needs_review: false },
           version: curVersion?.version_number || 1,
-          status: 'ACTIVE',
+          status: (row.status || 'ACTIVE') as DocumentStatus,
+          reviewed_by: row.reviewed_by,
+          reviewed_by_name: reviewerObj?.name || null,
+          reviewed_at: row.reviewed_at,
+          review_note: row.review_note,
           created_at: row.created_at,
           is_synthetic: false,
         };
@@ -288,6 +405,7 @@ export const documentsService = {
       title: doc.title,
       doc_type: doc.doc_type,
       sensitivity_level: doc.sensitivity_level,
+      mime_type: file.type || 'application/pdf',
       original_hash: doc.original_hash,
       computed_hash: doc.original_hash,
       system_signature: `RSA2048-SIG-${doc.id.slice(0, 8).toUpperCase()}`,
@@ -305,7 +423,7 @@ export const documentsService = {
       classification_confidence: doc.classification_confidence || 0.98,
       flags: doc.flags || { ocr_low_confidence: false, classification_needs_review: false },
       version: doc.version || 1,
-      status: 'ACTIVE',
+      status: 'PENDING_REVIEW',
       created_at: doc.created_at,
       is_synthetic: false,
     };
@@ -380,14 +498,14 @@ export const documentsService = {
 
   /**
    * Download document: calls real backend /api/v1/documents/:id/download,
-   * logs to immutable audit trail, and returns { signedUrl, filename, blob }
+   * logs to immutable audit trail, and returns { filename, blob }
    */
   async downloadDocument(
     docId: string,
     _userId?: string,
     _username?: string,
     versionNumber?: number
-  ): Promise<{ signedUrl: string; filename: string; blob: Blob }> {
+  ): Promise<{ filename: string; blob: Blob }> {
     const {
       data: { session },
     } = await supabase.auth.getSession();
@@ -409,18 +527,62 @@ export const documentsService = {
       throw new Error(errJson.error || `Download failed with HTTP ${res.status}`);
     }
 
-    const data = await res.json();
-    const signedUrl = data.signedUrl;
-    const filename = data.filename || `document_${docId}_v${data.version_number || 1}.pdf`;
+    const blob = await res.blob();
+    const contentDisposition = res.headers.get('Content-Disposition') || '';
+    const filenameMatch = contentDisposition.match(/filename="?([^"]+)"?/);
+    const filename = filenameMatch ? decodeURIComponent(filenameMatch[1]) : `document_${docId}.pdf`;
 
-    // Fetch the real file blob directly from the signed URL
-    const fileRes = await fetch(signedUrl);
-    if (!fileRes.ok) {
-      throw new Error(`Failed to retrieve file from secure storage: ${fileRes.statusText}`);
+    return { filename, blob };
+  },
+
+  /**
+   * View document: calls real backend /api/v1/documents/:id/view
+   * Returns a short-lived (60s) signed URL for inline rendering.
+   * Audit event logged as 'document_viewed' (not 'download').
+   */
+  async viewDocument(
+    docId: string,
+    versionNumber?: number
+  ): Promise<{
+    type: 'signed_url' | 'text_only';
+    url?: string;
+    signedUrl?: string;
+    filename?: string;
+    mime_type?: string;
+    expires_in?: number;
+    content?: string;
+  }> {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    const token = session?.access_token;
+    if (!token) {
+      throw new Error('Authentication required: no active session found.');
     }
-    const blob = await fileRes.blob();
 
-    return { signedUrl, filename, blob };
+    const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
+    const queryParam = versionNumber ? `?version_number=${versionNumber}` : '';
+    const res = await fetch(`${apiBase}/documents/${docId}/view${queryParam}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({ error: `View failed with HTTP ${res.status}` }));
+      throw new Error(errJson.error || `View failed with HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    return {
+      type: data.type || (data.url ? 'signed_url' : 'text_only'),
+      url: data.url || data.signedUrl,
+      signedUrl: data.signedUrl || data.url,
+      filename: data.filename || `document_${docId}_v${data.version_number || 1}.pdf`,
+      mime_type: data.mime_type || 'application/pdf',
+      expires_in: data.expires_in || 60,
+      content: data.content,
+    };
   },
 
   /**
@@ -465,5 +627,58 @@ export const documentsService = {
   async getAnomalyAlerts(): Promise<AnomalyAlert[]> {
     await delay(100);
     return [...db.anomalies];
+  },
+
+  /**
+   * Supervisor or Admin approves a document
+   */
+  async approveDocument(docId: string): Promise<DocumentRecord> {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    const token = session?.access_token;
+    if (!token) throw new Error('Authentication required');
+
+    const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
+    const res = await fetch(`${apiBase}/documents/${docId}/approve`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to approve document');
+    }
+    return data.document || data.data;
+  },
+
+  /**
+   * Supervisor or Admin rejects a document with reason
+   */
+  async rejectDocument(docId: string, reason: string): Promise<DocumentRecord> {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    const token = session?.access_token;
+    if (!token) throw new Error('Authentication required');
+
+    const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
+    const res = await fetch(`${apiBase}/documents/${docId}/reject`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ review_note: reason }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to reject document');
+    }
+    return data.document || data.data;
   },
 };

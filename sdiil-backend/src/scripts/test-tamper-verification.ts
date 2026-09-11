@@ -76,8 +76,28 @@ async function authenticateDemoUser(email: string, password: string, totpSecret?
   const { data: factors } = await supabase.auth.mfa.listFactors();
   const totpFactor = factors?.totp?.find((f) => f.status === 'verified');
 
-  if (totpFactor && totpSecret) {
-    const otpCode = generateTOTP(totpSecret);
+  let secret = totpSecret;
+  if (!secret) {
+    try {
+      const candidates = [
+        path.resolve(process.cwd(), 'sdiil-frontend/src/config/demoMfaSecrets.json'),
+        path.resolve(__dirname, '../../../sdiil-frontend/src/config/demoMfaSecrets.json'),
+        path.resolve(__dirname, '../../../../sdiil-frontend/src/config/demoMfaSecrets.json'),
+      ];
+      for (const p of candidates) {
+        if (fs.existsSync(p)) {
+          const json = JSON.parse(fs.readFileSync(p, 'utf8'));
+          secret = json[email.toLowerCase()]?.secret;
+          if (secret) break;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (totpFactor && secret) {
+    const otpCode = generateTOTP(secret);
     const { data: challengeData, error: challengeErr } = await supabase.auth.mfa.challenge({
       factorId: totpFactor.id,
     });
@@ -103,10 +123,14 @@ async function runTamperVerificationTests() {
   console.log('Authenticating demo users...');
   const officer = await authenticateDemoUser(
     'officer.demo@sdiil.test',
-    'Demo@Officer123',
-    'XXK4LHEU7K3XEOGWJ6TLIDYLWEWWQEQQ'
+    'Demo@Officer123'
   );
   console.log(`✓ Officer authenticated (ID: ${officer.userId})`);
+
+  const judge = await authenticateDemoUser(
+    'judge.demo@sdiil.test',
+    'Demo@Judge123'
+  );
 
   const adminClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 

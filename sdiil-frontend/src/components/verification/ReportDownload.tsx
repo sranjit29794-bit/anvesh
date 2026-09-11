@@ -20,7 +20,8 @@ export const ReportDownload: React.FC<ReportDownloadProps> = ({ result }) => {
       await verificationService.downloadVerificationReport(
         result.doc_id,
         result.version_number,
-        result.doc_title
+        result.doc_title,
+        result.verification_status === 'TAMPERED' || !result.hashes_match
       );
     } catch (err: any) {
       console.error('[ReportDownload] Backend PDF generation failed, falling back to text format:', err);

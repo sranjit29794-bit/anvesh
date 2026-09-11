@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
-import { createUserClient } from '../lib/supabaseUser.js';
+import { supabaseAdmin } from '../lib/supabaseAdmin.js';
+import { resolveUser, handleAuthError } from '../middleware/resolveUser.js';
 
 export const sharingRouter = Router();
 
@@ -9,27 +10,9 @@ export const sharingRouter = Router();
  */
 sharingRouter.get('/pending-approvals', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Authorization header required.' });
-    }
+    const { userId, userRole } = await resolveUser(req.headers.authorization);
 
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-    if (userError || !userData?.user) {
-      return res.status(401).json({ success: false, error: 'Invalid authentication session.' });
-    }
-
-    const userId = userData.user.id;
-
-    // Check caller role
-    const { data: userProfile } = await userClient
-      .from('profiles')
-      .select('role, name')
-      .eq('id', userId)
-      .single();
-
-    if (userProfile?.role !== 'supervisor' && userProfile?.role !== 'admin') {
+    if (userRole !== 'SUPERVISOR' && userRole !== 'ADMIN') {
       return res.status(403).json({
         success: false,
         error: 'Forbidden: Dual-authorization queue access restricted to Supervisor and Admin roles.',
@@ -37,7 +20,7 @@ sharingRouter.get('/pending-approvals', async (req: Request, res: Response) => {
     }
 
     // Query pending sharing events
-    const { data: pendingEvents, error: queryError } = await userClient
+    const { data: pendingEvents, error: queryError } = await supabaseAdmin
       .from('sharing_events')
       .select(`
         id,
@@ -118,36 +101,19 @@ sharingRouter.get('/pending-approvals', async (req: Request, res: Response) => {
  */
 sharingRouter.post('/:sharingEventId/approve', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Authorization header required.' });
-    }
+    const { userId, userRole } = await resolveUser(req.headers.authorization);
 
-    const { sharingEventId } = req.params;
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-    if (userError || !userData?.user) {
-      return res.status(401).json({ success: false, error: 'Invalid authentication session.' });
-    }
-
-    const userId = userData.user.id;
-
-    // Verify supervisor/admin role
-    const { data: userProfile } = await userClient
-      .from('profiles')
-      .select('role, name')
-      .eq('id', userId)
-      .single();
-
-    if (userProfile?.role !== 'supervisor' && userProfile?.role !== 'admin') {
+    if (userRole !== 'SUPERVISOR' && userRole !== 'ADMIN') {
       return res.status(403).json({
         success: false,
         error: 'Forbidden: Dual-authorization approvals require Supervisor or Admin clearance.',
       });
     }
 
+    const { sharingEventId } = req.params;
+
     // Retrieve sharing event with document case_id
-    const { data: shareEvent, error: shareErr } = await userClient
+    const { data: shareEvent, error: shareErr } = await supabaseAdmin
       .from('sharing_events')
       .select('*, documents(case_id)')
       .eq('id', sharingEventId)
@@ -160,7 +126,7 @@ sharingRouter.post('/:sharingEventId/approve', async (req: Request, res: Respons
     const docCaseId = (Array.isArray(shareEvent.documents) ? shareEvent.documents[0]?.case_id : (shareEvent.documents as any)?.case_id) || null;
 
     // Insert approvals row
-    const { data: approvalRow, error: appErr } = await userClient
+    const { data: approvalRow, error: appErr } = await supabaseAdmin
       .from('approvals')
       .insert({
         sharing_event_id: sharingEventId,
@@ -175,7 +141,7 @@ sharingRouter.post('/:sharingEventId/approve', async (req: Request, res: Respons
     }
 
     // Update sharing_events status to approved
-    const { data: updatedEvent, error: updateErr } = await userClient
+    const { data: updatedEvent, error: updateErr } = await supabaseAdmin
       .from('sharing_events')
       .update({ approval_status: 'approved' })
       .eq('id', sharingEventId)
@@ -187,7 +153,7 @@ sharingRouter.post('/:sharingEventId/approve', async (req: Request, res: Respons
     }
 
     // Insert audit_log row
-    await userClient.from('audit_log').insert({
+    await supabaseAdmin.from('audit_log').insert({
       user_id: userId,
       action: 'share_approved',
       resource_type: 'sharing_event',
@@ -200,8 +166,8 @@ sharingRouter.post('/:sharingEventId/approve', async (req: Request, res: Respons
         document_id: shareEvent.document_id,
         shared_with: shareEvent.shared_with,
         approver_id: userId,
-        approver_name: userProfile.name,
-        approver_role: userProfile.role,
+        approver_name: userRole,
+        approver_role: userRole,
       },
     });
 
@@ -213,6 +179,7 @@ sharingRouter.post('/:sharingEventId/approve', async (req: Request, res: Respons
       approval: approvalRow,
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Share Approve] Error:', err);
     return res.status(500).json({ success: false, error: err?.message || 'Approval action failed.' });
   }
@@ -224,38 +191,20 @@ sharingRouter.post('/:sharingEventId/approve', async (req: Request, res: Respons
  */
 sharingRouter.post('/:sharingEventId/reject', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Authorization header required.' });
-    }
+    const { userId, userRole } = await resolveUser(req.headers.authorization);
 
-    const { sharingEventId } = req.params;
-    const { reason } = req.body;
-
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-    if (userError || !userData?.user) {
-      return res.status(401).json({ success: false, error: 'Invalid authentication session.' });
-    }
-
-    const userId = userData.user.id;
-
-    // Verify supervisor/admin role
-    const { data: userProfile } = await userClient
-      .from('profiles')
-      .select('role, name')
-      .eq('id', userId)
-      .single();
-
-    if (userProfile?.role !== 'supervisor' && userProfile?.role !== 'admin') {
+    if (userRole !== 'SUPERVISOR' && userRole !== 'ADMIN') {
       return res.status(403).json({
         success: false,
         error: 'Forbidden: Dual-authorization rejections require Supervisor or Admin clearance.',
       });
     }
 
+    const { sharingEventId } = req.params;
+    const { reason } = req.body;
+
     // Retrieve sharing event with document case_id
-    const { data: shareEvent, error: shareErr } = await userClient
+    const { data: shareEvent, error: shareErr } = await supabaseAdmin
       .from('sharing_events')
       .select('*, documents(case_id)')
       .eq('id', sharingEventId)
@@ -268,7 +217,7 @@ sharingRouter.post('/:sharingEventId/reject', async (req: Request, res: Response
     const docCaseId = (Array.isArray(shareEvent.documents) ? shareEvent.documents[0]?.case_id : (shareEvent.documents as any)?.case_id) || null;
 
     // Insert approvals row
-    const { data: approvalRow, error: appErr } = await userClient
+    const { data: approvalRow, error: appErr } = await supabaseAdmin
       .from('approvals')
       .insert({
         sharing_event_id: sharingEventId,
@@ -284,7 +233,7 @@ sharingRouter.post('/:sharingEventId/reject', async (req: Request, res: Response
     }
 
     // Update sharing_events status to rejected
-    const { data: updatedEvent, error: updateErr } = await userClient
+    const { data: updatedEvent, error: updateErr } = await supabaseAdmin
       .from('sharing_events')
       .update({ approval_status: 'rejected' })
       .eq('id', sharingEventId)
@@ -296,7 +245,7 @@ sharingRouter.post('/:sharingEventId/reject', async (req: Request, res: Response
     }
 
     // Insert audit_log row
-    await userClient.from('audit_log').insert({
+    await supabaseAdmin.from('audit_log').insert({
       user_id: userId,
       action: 'share_rejected',
       resource_type: 'sharing_event',
@@ -309,7 +258,7 @@ sharingRouter.post('/:sharingEventId/reject', async (req: Request, res: Response
         document_id: shareEvent.document_id,
         shared_with: shareEvent.shared_with,
         approver_id: userId,
-        approver_name: userProfile.name,
+        approver_name: userRole,
         reason: reason || 'Statutory review denied by supervisor',
       },
     });
@@ -322,6 +271,7 @@ sharingRouter.post('/:sharingEventId/reject', async (req: Request, res: Response
       approval: approvalRow,
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Share Reject] Error:', err);
     return res.status(500).json({ success: false, error: err?.message || 'Rejection action failed.' });
   }
@@ -333,15 +283,10 @@ sharingRouter.post('/:sharingEventId/reject', async (req: Request, res: Response
  */
 sharingRouter.get('/events', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Authorization header required.' });
-    }
-
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
     const { document_id } = req.query;
-    const userClient = createUserClient(authHeader);
 
-    let query = userClient
+    let query = supabaseAdmin
       .from('sharing_events')
       .select(`
         id,
@@ -392,12 +337,26 @@ sharingRouter.get('/events', async (req: Request, res: Response) => {
       return res.status(500).json({ success: false, error: error.message });
     }
 
+    let filteredEvents = events || [];
+    if (userRole !== 'ADMIN' && userRole !== 'SUPERVISOR') {
+      filteredEvents = filteredEvents.filter((e: any) => {
+        const doc = Array.isArray(e.documents) ? e.documents[0] : e.documents;
+        const caseId = doc?.case_id;
+        return (
+          e.shared_by === userId ||
+          e.shared_with === userId ||
+          (caseId && userCaseIds.includes(caseId))
+        );
+      });
+    }
+
     return res.json({
       success: true,
-      events: events || [],
-      count: events?.length || 0,
+      events: filteredEvents,
+      count: filteredEvents.length,
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     return res.status(500).json({ success: false, error: err?.message || 'Failed to list events.' });
   }
 });

@@ -10,7 +10,16 @@ export type DocType =
   | 'LEGAL_NOTICE'
   | 'OTHER';
 
-export type DocumentStatus = 'ACTIVE' | 'ARCHIVED' | 'FLAGGED';
+export type DocumentStatus = 'PENDING_REVIEW' | 'ACTIVE' | 'REJECTED';
+
+export type DocumentMimeType =
+  | 'application/pdf'
+  | 'image/jpeg'
+  | 'image/png'
+  | 'image/tiff'
+  | 'text/plain'
+  | 'application/octet-stream'
+  | string;
 
 export interface DocumentFlags {
   ocr_low_confidence?: boolean;
@@ -50,6 +59,7 @@ export interface DocumentRecord {
   title: string;
   doc_type: DocType;
   sensitivity_level: SensitivityLevel;
+  mime_type?: DocumentMimeType;
   original_hash: string;
   computed_hash?: string;
   system_signature: string;
@@ -60,6 +70,10 @@ export interface DocumentRecord {
   flags: DocumentFlags;
   version: number;
   status: DocumentStatus;
+  reviewed_by?: string | null;
+  reviewed_by_name?: string | null;
+  reviewed_at?: string | null;
+  review_note?: string | null;
   created_at: string;
   is_synthetic: boolean;
   access_expiry?: string; // If access is time-limited

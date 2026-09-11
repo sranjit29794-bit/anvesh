@@ -1,52 +1,25 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
-import { createUserClient } from '../lib/supabaseUser.js';
 import { supabaseAdmin } from '../lib/supabaseAdmin.js';
+import { resolveUser, handleAuthError } from '../middleware/resolveUser.js';
 
 export const adminRouter = Router();
+const supabase = supabaseAdmin;
 
 /**
- * Helper: Validates that the request comes from an authenticated user with role = 'ADMIN'.
- * Returns caller details or responds with 401/403 and returns null.
+ * Helper: Resolves caller user ID and verifies ADMIN role from profiles table.
+ * Returns null and responds with 401 or 403 if token is missing/invalid or role is not ADMIN.
  */
-async function verifyAdminCaller(
-  req: Request,
-  res: Response
-): Promise<{ callerId: string; callerRole: string } | null> {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ success: false, error: 'Authorization header with Bearer JWT is required.' });
-    return null;
-  }
-
+async function getCallerUserId(req: Request, res: Response): Promise<string | null> {
   try {
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-    if (userError || !userData?.user) {
-      res.status(401).json({ success: false, error: 'Invalid or expired session token.' });
+    const { userId, userRole } = await resolveUser(req.headers.authorization);
+    if (userRole !== 'ADMIN' && userRole !== 'SUPER_ADMIN') {
+      res.status(403).json({ error: 'Admin access required' });
       return null;
     }
-
-    const callerId = userData.user.id;
-    const { data: profile, error: profileErr } = await supabaseAdmin
-      .from('profiles')
-      .select('id, name, role')
-      .eq('id', callerId)
-      .maybeSingle();
-
-    if (profileErr || !profile) {
-      res.status(403).json({ success: false, error: 'Caller profile not found or access denied.' });
-      return null;
-    }
-
-    const role = (profile.role || '').toUpperCase();
-    if (role !== 'ADMIN') {
-      res.status(403).json({ success: false, error: 'Forbidden: Administrator clearance required.' });
-      return null;
-    }
-
-    return { callerId, callerRole: role };
+    return userId;
   } catch (err: any) {
+    if (handleAuthError(res, err)) return null;
     res.status(401).json({ success: false, error: err?.message || 'Authentication error.' });
     return null;
   }
@@ -104,8 +77,20 @@ function generateSecureTempPassword(): string {
  * Provision a new officer/judge account in Supabase Auth & profiles table.
  */
 adminRouter.post('/users', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     const { email, full_name, role, department } = req.body;
@@ -126,7 +111,7 @@ adminRouter.post('/users', async (req: Request, res: Response) => {
       email_confirm: true,
       user_metadata: {
         name: full_name.trim(),
-        role: role.trim().toLowerCase(),
+        role: role.trim().toUpperCase(),
         department: department?.trim() || 'Investigation',
       },
     });
@@ -144,7 +129,7 @@ adminRouter.post('/users', async (req: Request, res: Response) => {
     const { error: profileError } = await supabaseAdmin.from('profiles').upsert({
       id: newUserId,
       name: full_name.trim(),
-      role: role.trim().toLowerCase(),
+      role: role.trim().toUpperCase(),
       department: department?.trim() || 'Investigation',
       account_status: 'ACTIVE',
       is_locked: false,
@@ -162,7 +147,7 @@ adminRouter.post('/users', async (req: Request, res: Response) => {
 
     // 3. Write immutable audit log entry
     await supabaseAdmin.from('audit_log').insert({
-      user_id: adminCaller.callerId,
+      user_id: callerUserId,
       action: 'admin_create_user',
       resource_type: 'user',
       resource_id: newUserId,
@@ -172,7 +157,7 @@ adminRouter.post('/users', async (req: Request, res: Response) => {
         new_user_role: role.trim().toUpperCase(),
         department: department?.trim() || 'Investigation',
         full_name: full_name.trim(),
-        provisioned_by: adminCaller.callerId,
+        provisioned_by: callerUserId,
       },
     });
 
@@ -200,8 +185,20 @@ adminRouter.post('/users', async (req: Request, res: Response) => {
  * List all users with profiles, auth data, and assigned case counts.
  */
 adminRouter.get('/users', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     // 1. Fetch all profiles
@@ -271,8 +268,20 @@ adminRouter.get('/users', async (req: Request, res: Response) => {
  * Update user judicial / investigative role in profiles table.
  */
 adminRouter.patch('/users/:userId/role', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     const { userId } = req.params;
@@ -282,7 +291,7 @@ adminRouter.patch('/users/:userId/role', async (req: Request, res: Response) => 
       return res.status(400).json({ success: false, error: 'Target role is required.' });
     }
 
-    const normalizedRole = role.trim().toLowerCase();
+    const normalizedRole = role.trim().toUpperCase();
 
     const { error: updateErr } = await supabaseAdmin
       .from('profiles')
@@ -300,19 +309,19 @@ adminRouter.patch('/users/:userId/role', async (req: Request, res: Response) => 
 
     // Audit log
     await supabaseAdmin.from('audit_log').insert({
-      user_id: adminCaller.callerId,
+      user_id: callerUserId,
       action: 'admin_update_role',
       resource_type: 'user',
       resource_id: userId,
       ip_address: req.ip || '127.0.0.1',
-      metadata: { new_role: role.trim().toUpperCase(), updated_by: adminCaller.callerId },
+      metadata: { new_role: normalizedRole, updated_by: callerUserId },
     });
 
     return res.status(200).json({
       success: true,
       message: 'User role updated successfully.',
       userId,
-      role: role.trim().toUpperCase(),
+      role: normalizedRole,
     });
   } catch (err: any) {
     console.error('[AdminRouter] Error updating role:', err);
@@ -325,8 +334,20 @@ adminRouter.patch('/users/:userId/role', async (req: Request, res: Response) => 
  * Lock profile and ban auth account to invalidate active JWTs immediately.
  */
 adminRouter.patch('/users/:userId/lock', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     const { userId } = req.params;
@@ -352,12 +373,12 @@ adminRouter.patch('/users/:userId/lock', async (req: Request, res: Response) => 
 
     // 3. Audit log
     await supabaseAdmin.from('audit_log').insert({
-      user_id: adminCaller.callerId,
+      user_id: callerUserId,
       action: 'admin_lock_user',
       resource_type: 'user',
       resource_id: userId,
       ip_address: req.ip || '127.0.0.1',
-      metadata: { status: 'LOCKED', locked_by: adminCaller.callerId },
+      metadata: { status: 'LOCKED', locked_by: callerUserId },
     });
 
     return res.status(200).json({
@@ -376,8 +397,20 @@ adminRouter.patch('/users/:userId/lock', async (req: Request, res: Response) => 
  * Unlock profile and remove auth ban.
  */
 adminRouter.patch('/users/:userId/unlock', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     const { userId } = req.params;
@@ -403,12 +436,12 @@ adminRouter.patch('/users/:userId/unlock', async (req: Request, res: Response) =
 
     // 3. Audit log
     await supabaseAdmin.from('audit_log').insert({
-      user_id: adminCaller.callerId,
+      user_id: callerUserId,
       action: 'admin_unlock_user',
       resource_type: 'user',
       resource_id: userId,
       ip_address: req.ip || '127.0.0.1',
-      metadata: { status: 'ACTIVE', unlocked_by: adminCaller.callerId },
+      metadata: { status: 'ACTIVE', unlocked_by: callerUserId },
     });
 
     return res.status(200).json({
@@ -427,8 +460,20 @@ adminRouter.patch('/users/:userId/unlock', async (req: Request, res: Response) =
  * Reset and unenroll all MFA factors for the user so they must re-enroll on next sign-in.
  */
 adminRouter.patch('/users/:userId/reset-mfa', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     const { userId } = req.params;
@@ -453,12 +498,12 @@ adminRouter.patch('/users/:userId/reset-mfa', async (req: Request, res: Response
 
     // 2. Audit log
     await supabaseAdmin.from('audit_log').insert({
-      user_id: adminCaller.callerId,
+      user_id: callerUserId,
       action: 'admin_reset_mfa',
       resource_type: 'user',
       resource_id: userId,
       ip_address: req.ip || '127.0.0.1',
-      metadata: { mfa_reset: true, reset_by: adminCaller.callerId },
+      metadata: { mfa_reset: true, reset_by: callerUserId },
     });
 
     return res.status(200).json({
@@ -481,8 +526,20 @@ adminRouter.patch('/users/:userId/reset-mfa', async (req: Request, res: Response
  * Provision a new case folder.
  */
 adminRouter.post('/cases', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     const { case_id, title, description, department, status } = req.body;
@@ -502,7 +559,7 @@ adminRouter.post('/cases', async (req: Request, res: Response) => {
         description: description?.trim() || '',
         department: department?.trim() || 'Crime Branch',
         status: (status || 'open').toLowerCase(),
-        created_by: adminCaller.callerId,
+        created_by: callerUserId,
       })
       .select()
       .single();
@@ -517,13 +574,13 @@ adminRouter.post('/cases', async (req: Request, res: Response) => {
     // Auto-assign the admin creator to the new case
     await supabaseAdmin.from('case_assignments').upsert({
       case_id: newCase.id,
-      user_id: adminCaller.callerId,
+      user_id: callerUserId,
       role_in_case: 'ADMIN',
     });
 
     // Audit log
     await supabaseAdmin.from('audit_log').insert({
-      user_id: adminCaller.callerId,
+      user_id: callerUserId,
       action: 'admin_create_case',
       resource_type: 'case',
       resource_id: newCase.id,
@@ -552,8 +609,20 @@ adminRouter.post('/cases', async (req: Request, res: Response) => {
  * List all cases with document and assigned user counts.
  */
 adminRouter.get('/cases', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     const { data: cases, error: casesErr } = await supabaseAdmin
@@ -619,8 +688,20 @@ adminRouter.get('/cases', async (req: Request, res: Response) => {
  * Assign a user to a case.
  */
 adminRouter.post('/cases/:caseId/assign', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     const { caseId } = req.params;
@@ -656,7 +737,7 @@ adminRouter.post('/cases/:caseId/assign', async (req: Request, res: Response) =>
 
     // Audit log
     await supabaseAdmin.from('audit_log').insert({
-      user_id: adminCaller.callerId,
+      user_id: callerUserId,
       action: 'admin_assign_user',
       resource_type: 'case',
       resource_id: caseUuid,
@@ -665,7 +746,7 @@ adminRouter.post('/cases/:caseId/assign', async (req: Request, res: Response) =>
       metadata: {
         assigned_user_id: userId,
         role_in_case: role_in_case || 'INVESTIGATOR',
-        assigned_by: adminCaller.callerId,
+        assigned_by: callerUserId,
       },
     });
 
@@ -685,8 +766,20 @@ adminRouter.post('/cases/:caseId/assign', async (req: Request, res: Response) =>
  * Remove a user from a case.
  */
 adminRouter.delete('/cases/:caseId/assign/:userId', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     const { caseId, userId } = req.params;
@@ -708,7 +801,7 @@ adminRouter.delete('/cases/:caseId/assign/:userId', async (req: Request, res: Re
 
     // Audit log
     await supabaseAdmin.from('audit_log').insert({
-      user_id: adminCaller.callerId,
+      user_id: callerUserId,
       action: 'admin_remove_user',
       resource_type: 'case',
       resource_id: caseUuid,
@@ -716,7 +809,7 @@ adminRouter.delete('/cases/:caseId/assign/:userId', async (req: Request, res: Re
       ip_address: req.ip || '127.0.0.1',
       metadata: {
         removed_user_id: userId,
-        removed_by: adminCaller.callerId,
+        removed_by: callerUserId,
       },
     });
 
@@ -739,8 +832,20 @@ adminRouter.delete('/cases/:caseId/assign/:userId', async (req: Request, res: Re
  * Cross-system aggregated statistics (unrestricted by RLS via service role).
  */
 adminRouter.get('/stats', async (req: Request, res: Response) => {
-  const adminCaller = await verifyAdminCaller(req, res);
-  if (!adminCaller) return;
+  const callerUserId = await getCallerUserId(req, res);
+  if (!callerUserId) return;
+
+  const callerProfile = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', callerUserId)
+    .single()
+
+  if (callerProfile.data?.role !== 'ADMIN') {
+    return res.status(403).json({ 
+      error: 'Admin access required' 
+    })
+  }
 
   try {
     const [

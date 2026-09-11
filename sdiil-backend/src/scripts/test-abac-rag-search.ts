@@ -1,6 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
@@ -78,8 +80,29 @@ async function authenticateDemoUser(
   const { data: factors } = await supabase.auth.mfa.listFactors();
   const totpFactor = factors?.totp?.find((f) => f.status === 'verified');
 
-  if (totpFactor && totpSecret) {
-    const otpCode = generateTOTP(totpSecret);
+  let secret = totpSecret;
+  try {
+    const candidates = [
+      path.resolve(process.cwd(), 'sdiil-frontend/src/config/demoMfaSecrets.json'),
+      path.resolve(__dirname, '../../../sdiil-frontend/src/config/demoMfaSecrets.json'),
+      path.resolve(__dirname, '../../../../sdiil-frontend/src/config/demoMfaSecrets.json'),
+      path.resolve(process.cwd(), '../sdiil-frontend/src/config/demoMfaSecrets.json'),
+    ];
+    for (const p of candidates) {
+      if (fs.existsSync(p)) {
+        const json = JSON.parse(fs.readFileSync(p, 'utf8'));
+        if (json[email.toLowerCase()]?.secret) {
+          secret = json[email.toLowerCase()].secret;
+          break;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  if (totpFactor && secret) {
+    const otpCode = generateTOTP(secret);
     const { data: challengeData, error: challengeErr } = await supabase.auth.mfa.challenge({
       factorId: totpFactor.id,
     });

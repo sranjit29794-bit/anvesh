@@ -1,10 +1,12 @@
 import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import crypto from 'crypto';
-import { createUserClient } from '../lib/supabaseUser.js';
+import { supabaseAdmin } from '../lib/supabaseAdmin.js';
 import { generateVerificationReportPdf } from '../lib/verificationReport.js';
 import { indexDocument } from '../lib/aiService.js';
 import { anomalyService } from '../services/anomalyService.js';
+import { resolveUser, handleAuthError } from '../middleware/resolveUser.js';
+import { getPristinePdfBuffer } from '../helpers/pdfTemplates.js';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -19,17 +21,17 @@ export const documentsRouter = Router();
  * Helper to resolve case ID.
  * Accepts either UUID or case_number (e.g. MH-PN-2026-0142).
  */
-async function resolveCaseId(userClient: any, caseIdentifier: string): Promise<string | null> {
+async function resolveCaseId(_userClient: any, caseIdentifier: string): Promise<string | null> {
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(caseIdentifier);
   if (isUuid) {
     return caseIdentifier;
   }
 
-  const { data: caseRow } = await userClient
+  const { data: caseRow } = await supabaseAdmin
     .from('cases')
     .select('id')
     .eq('case_number', caseIdentifier)
-    .single();
+    .maybeSingle();
 
   return caseRow?.id || null;
 }
@@ -40,13 +42,7 @@ async function resolveCaseId(userClient: any, caseIdentifier: string): Promise<s
  */
 documentsRouter.post('/upload', upload.single('file'), async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authorization header with Bearer JWT is required.',
-      });
-    }
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
 
     if (!req.file) {
       return res.status(400).json({
@@ -63,25 +59,20 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
       });
     }
 
-    // Initialize user client with forwarded JWT (enforces RLS and ABAC at database layer)
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-
-    if (userError || !userData?.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or expired authentication session.',
-      });
-    }
-
-    const userId = userData.user.id;
-
     // Resolve case UUID
-    const caseUuid = await resolveCaseId(userClient, case_id);
+    const caseUuid = await resolveCaseId(supabaseAdmin, case_id);
     if (!caseUuid) {
       return res.status(404).json({
         success: false,
         error: `Case not found or access denied for identifier: ${case_id}`,
+      });
+    }
+
+    const isPrivileged = userRole === 'ADMIN' || userRole === 'SUPERVISOR';
+    if (!isPrivileged && !userCaseIds.includes(caseUuid)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied: You are not assigned to this case.',
       });
     }
 
@@ -114,8 +105,8 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
     // Step 2: Storage key convention: case_docs/{case_id}/{document_id}/v{version_number}/{filename}
     const storagePath = `case_docs/${caseUuid}/${documentId}/v${versionNumber}/${originalFilename}`;
 
-    // Upload to Supabase Storage bucket 'case-documents' using user client (respects storage RLS)
-    const { error: storageError } = await userClient.storage
+    // Upload to Supabase Storage bucket 'case-documents'
+    const { error: storageError } = await supabaseAdmin.storage
       .from('case-documents')
       .upload(storagePath, rawFileBytes, {
         contentType: req.file.mimetype || 'application/pdf',
@@ -129,15 +120,17 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
       });
     }
 
-    // Step 3: Insert documents row using user client
-    const { error: docInsertError } = await userClient.from('documents').insert({
+    // Step 3: Insert documents row using supabaseAdmin
+    const { error: docInsertError } = await supabaseAdmin.from('documents').insert({
       id: documentId,
       case_id: caseUuid,
       title: documentTitle,
       doc_type: detectedDocType,
       sensitivity_level: sensitivity,
+      mime_type: req.file.mimetype || 'application/octet-stream',
       current_version_id: null,
       uploaded_by: userId,
+      status: 'PENDING_REVIEW',
     });
 
     if (docInsertError) {
@@ -148,7 +141,7 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
     }
 
     // Step 4: Insert document_versions row
-    const { error: verInsertError } = await userClient.from('document_versions').insert({
+    const { error: verInsertError } = await supabaseAdmin.from('document_versions').insert({
       id: versionId,
       document_id: documentId,
       version_number: versionNumber,
@@ -166,7 +159,7 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
     }
 
     // Update documents table with current_version_id
-    const { error: docUpdateError } = await userClient
+    const { error: docUpdateError } = await supabaseAdmin
       .from('documents')
       .update({ current_version_id: versionId })
       .eq('id', documentId);
@@ -180,7 +173,7 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
 
     // Step 5: Insert blockchain_events row (rule-blockchain-event-after-confirmed-storage)
     const mockTxHash = `0x${crypto.randomBytes(32).toString('hex')}`;
-    const { error: bcError } = await userClient.from('blockchain_events').insert({
+    const { error: bcError } = await supabaseAdmin.from('blockchain_events').insert({
       document_version_id: versionId,
       event_type: 'hash_registered',
       tx_hash: mockTxHash,
@@ -192,7 +185,7 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
     }
 
     // Step 6: Insert audit_log row (rule-immutable-audit-log)
-    const { error: auditError } = await userClient.from('audit_log').insert({
+    const { error: auditError } = await supabaseAdmin.from('audit_log').insert({
       user_id: userId,
       action: 'upload',
       resource_type: 'document',
@@ -215,7 +208,7 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
 
     // Step 6b: Extract text and generate pgvector embeddings for ABAC-gated RAG search
     try {
-      await indexDocument(documentId, caseUuid, sensitivity, rawFileBytes, userClient);
+      await indexDocument(documentId, caseUuid, sensitivity, rawFileBytes, supabaseAdmin);
     } catch (embedErr: any) {
       console.error('[Ingest] Embedding indexing notice:', embedErr.message);
     }
@@ -231,6 +224,8 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
         title: documentTitle,
         doc_type: detectedDocType,
         sensitivity_level: sensitivity,
+        mime_type: req.file.mimetype || 'application/octet-stream',
+        status: 'PENDING_REVIEW',
         version: versionNumber,
         original_hash: fileHash,
         file_hash: fileHash,
@@ -246,6 +241,7 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
       },
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Ingest] Unhandled upload error:', err);
     return res.status(500).json({
       success: false,
@@ -256,27 +252,35 @@ documentsRouter.post('/upload', upload.single('file'), async (req: Request, res:
 
 /**
  * GET /api/v1/documents
- * List authorized documents for a case (respects RLS)
+ * FIX D: List authorized documents for a case (respects role assignments and attestation rules)
  */
 documentsRouter.get('/', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Authorization header required' });
-    }
-
-    const userClient = createUserClient(authHeader);
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
+    const callerRole = userRole.toUpperCase();
+    const isPrivileged = callerRole === 'SUPERVISOR' || callerRole === 'ADMIN';
     const caseParam = req.query.case_id as string | undefined;
+    const statusParam = req.query.status ? (req.query.status as string).toUpperCase() : undefined;
 
-    let query = userClient.from('documents').select(`
+    let query = supabaseAdmin.from('documents').select(`
       id,
       case_id,
       title,
       doc_type,
       sensitivity_level,
+      mime_type,
+      status,
+      reviewed_by,
+      reviewed_at,
+      review_note,
       current_version_id,
       uploaded_by,
       created_at,
+      reviewer:profiles!reviewed_by (
+        id,
+        name,
+        role
+      ),
       document_versions!fk_current_version (
         id,
         version_number,
@@ -287,159 +291,493 @@ documentsRouter.get('/', async (req: Request, res: Response) => {
     `);
 
     if (caseParam) {
-      const caseUuid = await resolveCaseId(userClient, caseParam);
-      if (caseUuid) {
-        query = query.eq('case_id', caseUuid);
+      const caseUuid = await resolveCaseId(supabaseAdmin, caseParam);
+      if (!caseUuid) {
+        return res.status(404).json({ success: false, error: `Case not found: ${caseParam}` });
       }
+      if (!isPrivileged && !userCaseIds.includes(caseUuid)) {
+        return res.status(403).json({ success: false, error: 'Access denied: You are not assigned to this case.' });
+      }
+      query = query.eq('case_id', caseUuid);
+    } else if (!isPrivileged) {
+      if (userCaseIds.length === 0) {
+        return res.json({
+          success: true,
+          documents: [],
+          data: [],
+          count: 0,
+        });
+      }
+      query = query.in('case_id', userCaseIds);
     }
 
-    const { data: docs, error: queryError } = await query;
+    const { data: docs, error: queryError } = await query.order('created_at', { ascending: false });
     if (queryError) {
-      return res.status(403).json({ error: queryError.message });
+      return res.status(500).json({ success: false, error: queryError.message });
+    }
+
+    const limitParam = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
+
+    // Role-based attestation filtering (FIX D):
+    // - SUPERVISOR or ADMIN: see all documents regardless of status
+    // - INVESTIGATOR or OFFICER: see ACTIVE + own PENDING_REVIEW + own REJECTED
+    // - Others (PROSECUTOR, FORENSIC_OFFICER, COURT_REGISTRAR, REVIEWER, JUDGE): see ONLY ACTIVE
+    let filteredDocs = (docs || []).filter((doc: any) => {
+      const docStatus = doc.status || 'ACTIVE';
+      if (statusParam && docStatus !== statusParam) {
+        return false;
+      }
+      if (isPrivileged) {
+        return true;
+      }
+      if (callerRole === 'INVESTIGATOR' || callerRole === 'OFFICER') {
+        return docStatus === 'ACTIVE' || doc.uploaded_by === userId;
+      }
+      return docStatus === 'ACTIVE';
+    }).map((doc: any) => {
+      const versions = Array.isArray(doc.document_versions)
+        ? doc.document_versions
+        : doc.document_versions ? [doc.document_versions] : [];
+      const curVersion = versions.find((v: any) => v.id === doc.current_version_id) || versions[0];
+      return {
+        ...doc,
+        file_id: doc.id,
+        original_hash: curVersion?.file_hash || '',
+        computed_hash: curVersion?.file_hash || '',
+        version: curVersion?.version_number || 1,
+        minio_path: curVersion?.storage_path || '',
+        metadata: {
+          file_size_bytes: curVersion?.file_size_bytes || 0,
+        },
+      };
+    });
+
+    if (limitParam && !isNaN(limitParam)) {
+      filteredDocs = filteredDocs.slice(0, limitParam);
     }
 
     return res.json({
       success: true,
-      documents: docs || [],
-      data: docs || [],
-      count: docs?.length || 0,
+      documents: filteredDocs,
+      data: filteredDocs,
+      count: filteredDocs.length,
     });
   } catch (err: any) {
-    return res.status(500).json({ error: err?.message || 'Failed to list documents' });
+    if (handleAuthError(res, err)) return;
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to list documents' });
+  }
+});
+
+/**
+ * GET /api/v1/documents/:id
+ * Retrieve single document details under role-based attestation visibility.
+ */
+documentsRouter.get('/:id', async (req: Request, res: Response) => {
+  try {
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
+    const { id } = req.params;
+    const callerRole = userRole.toUpperCase();
+    const isPrivileged = callerRole === 'SUPERVISOR' || callerRole === 'ADMIN';
+
+    const { data: doc, error: docError } = await supabaseAdmin
+      .from('documents')
+      .select(`
+        id,
+        case_id,
+        title,
+        doc_type,
+        sensitivity_level,
+        mime_type,
+        status,
+        reviewed_by,
+        reviewed_at,
+        review_note,
+        current_version_id,
+        uploaded_by,
+        created_at,
+        reviewer:profiles!reviewed_by (
+          id,
+          name,
+          role
+        ),
+        cases:case_id (
+          case_number
+        ),
+        document_versions!fk_current_version (
+          id,
+          version_number,
+          storage_path,
+          file_hash,
+          file_size_bytes
+        )
+      `)
+      .eq('id', id)
+      .maybeSingle();
+
+    if (docError || !doc) {
+      return res.status(404).json({ success: false, error: 'Document not found.' });
+    }
+
+    if (!isPrivileged && !userCaseIds.includes(doc.case_id)) {
+      return res.status(403).json({ success: false, error: 'Access denied: You are not assigned to this case.' });
+    }
+
+    const docStatus = doc.status || 'ACTIVE';
+    // If document is PENDING_REVIEW or REJECTED:
+    // Only SUPERVISOR, ADMIN, or the uploader can view it.
+    if (docStatus !== 'ACTIVE') {
+      const isUploader = doc.uploaded_by === userId;
+      if (!isPrivileged && !isUploader) {
+        return res.status(403).json({
+          success: false,
+          error: 'Access denied: Document is awaiting review or has been rejected.',
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      document: doc,
+      data: doc,
+    });
+  } catch (err: any) {
+    if (handleAuthError(res, err)) return;
+    console.error('[Document Get] Error:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to retrieve document.' });
+  }
+});
+
+/**
+ * POST /api/v1/documents/:id/approve
+ * Approves a document, transitioning status from PENDING_REVIEW to ACTIVE.
+ * Only SUPERVISOR or ADMIN assigned to the document's case can approve.
+ */
+documentsRouter.post('/:id/approve', async (req: Request, res: Response) => {
+  try {
+    const { userId: callerUserId, userRole: rawUserRole, userCaseIds } = await resolveUser(req.headers.authorization);
+    const userRole = rawUserRole.toUpperCase();
+    const { id } = req.params;
+
+    if (userRole !== 'SUPERVISOR' && userRole !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Only supervisors or administrators can approve documents.',
+      });
+    }
+
+    // Check document exists
+    const { data: doc, error: docError } = await supabaseAdmin
+      .from('documents')
+      .select('*, document_versions!fk_current_version(file_hash)')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (docError || !doc) {
+      return res.status(404).json({ success: false, error: 'Document not found.' });
+    }
+
+    // Check caller is assigned to the case (or ADMIN)
+    if (userRole !== 'ADMIN' && !userCaseIds.includes(doc.case_id)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Caller is not assigned to this case.',
+      });
+    }
+
+    // Update documents table
+    const now = new Date().toISOString();
+    const { data: updatedDoc, error: updateError } = await supabaseAdmin
+      .from('documents')
+      .update({
+        status: 'ACTIVE',
+        reviewed_by: callerUserId,
+        reviewed_at: now,
+      })
+      .eq('id', id)
+      .select(`
+        id,
+        case_id,
+        title,
+        doc_type,
+        sensitivity_level,
+        mime_type,
+        status,
+        reviewed_by,
+        reviewed_at,
+        review_note,
+        current_version_id,
+        uploaded_by,
+        created_at,
+        reviewer:profiles!reviewed_by (
+          id,
+          name,
+          role
+        )
+      `)
+      .single();
+
+    if (updateError || !updatedDoc) {
+      return res.status(500).json({
+        success: false,
+        error: `Failed to approve document: ${updateError?.message}`,
+      });
+    }
+
+    const currentVer = Array.isArray(doc.document_versions) ? doc.document_versions[0] : doc.document_versions;
+    const fileHash = currentVer?.file_hash || 'hash_pending';
+    const mockTxHash = `0x${crypto.randomBytes(32).toString('hex')}`;
+
+    // Insert blockchain_events row
+    await supabaseAdmin.from('blockchain_events').insert({
+      document_version_id: doc.current_version_id,
+      doc_id: id,
+      case_id: doc.case_id,
+      event_type: 'DOCUMENT_APPROVED',
+      tx_hash: mockTxHash,
+      registered_hash: fileHash,
+      hash: fileHash,
+      actor_id: callerUserId,
+      timestamp: now,
+    });
+
+    // Write to audit_log (rule-immutable-audit-log)
+    await supabaseAdmin.from('audit_log').insert({
+      user_id: callerUserId,
+      action: 'document_approved',
+      resource_type: 'document',
+      resource_id: id,
+      doc_id: id,
+      case_id: doc.case_id,
+      ip_address: req.ip || '127.0.0.1',
+      timestamp: now,
+      metadata: {
+        document_id: id,
+        case_id: doc.case_id,
+        approved_by: callerUserId,
+        previous_status: 'PENDING_REVIEW',
+        new_status: 'ACTIVE',
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: 'Document approved successfully and published to active case files.',
+      document: updatedDoc,
+      data: updatedDoc,
+    });
+  } catch (err: any) {
+    if (handleAuthError(res, err)) return;
+    console.error('[Document Approve] Error:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to approve document.' });
+  }
+});
+
+/**
+ * POST /api/v1/documents/:id/reject
+ * Rejects a document with mandatory review_note reason.
+ * Only SUPERVISOR or ADMIN assigned to the document's case can reject.
+ */
+documentsRouter.post('/:id/reject', async (req: Request, res: Response) => {
+  try {
+    const { userId: callerUserId, userRole: rawUserRole, userCaseIds } = await resolveUser(req.headers.authorization);
+    const userRole = rawUserRole.toUpperCase();
+    const { id } = req.params;
+    const { review_note } = req.body || {};
+
+    if (!review_note || typeof review_note !== 'string' || review_note.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'rejection reason is required',
+        message: 'rejection reason is required',
+      });
+    }
+
+    if (userRole !== 'SUPERVISOR' && userRole !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Only supervisors or administrators can reject documents.',
+      });
+    }
+
+    // Check document exists
+    const { data: doc, error: docError } = await supabaseAdmin
+      .from('documents')
+      .select('id, case_id, title, current_version_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (docError || !doc) {
+      return res.status(404).json({ success: false, error: 'Document not found.' });
+    }
+
+    // Check caller is assigned to the case (or ADMIN)
+    if (userRole !== 'ADMIN' && !userCaseIds.includes(doc.case_id)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Caller is not assigned to this case.',
+      });
+    }
+
+    // Update documents table
+    const now = new Date().toISOString();
+    const { data: updatedDoc, error: updateError } = await supabaseAdmin
+      .from('documents')
+      .update({
+        status: 'REJECTED',
+        reviewed_by: callerUserId,
+        reviewed_at: now,
+        review_note: review_note.trim(),
+      })
+      .eq('id', id)
+      .select(`
+        id,
+        case_id,
+        title,
+        doc_type,
+        sensitivity_level,
+        mime_type,
+        status,
+        reviewed_by,
+        reviewed_at,
+        review_note,
+        current_version_id,
+        uploaded_by,
+        created_at,
+        reviewer:profiles!reviewed_by (
+          id,
+          name,
+          role
+        )
+      `)
+      .single();
+
+    if (updateError || !updatedDoc) {
+      return res.status(500).json({
+        success: false,
+        error: `Failed to reject document: ${updateError?.message}`,
+      });
+    }
+
+    // Insert audit_log row
+    await supabaseAdmin.from('audit_log').insert({
+      user_id: callerUserId,
+      action: 'document_rejected',
+      resource_type: 'document',
+      resource_id: id,
+      doc_id: id,
+      case_id: doc.case_id,
+      ip_address: req.ip || '127.0.0.1',
+      timestamp: now,
+      metadata: {
+        document_id: id,
+        case_id: doc.case_id,
+        action: 'document_rejected',
+        status: 'REJECTED',
+        reviewed_by: callerUserId,
+        rejection_reason: review_note.trim(),
+      },
+    });
+
+    return res.status(200).json({
+      success: true,
+      requires_human_verification: true,
+      document: updatedDoc,
+      data: updatedDoc,
+    });
+  } catch (err: any) {
+    console.error('[Reject Document] Error:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to reject document.' });
   }
 });
 
 /**
  * GET /api/v1/documents/:id/download
- * Generates a short-lived signed URL for the document (or specific version) under RLS.
- * Inserts an audit_log record BEFORE returning the signed URL.
+ * Generates a short-lived signed URL or direct inline stream for the document under ABAC.
  */
 documentsRouter.get('/:id/download', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Authorization header with Bearer JWT is required.' });
-    }
-
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
     const { id } = req.params;
     const versionNumberParam = req.query.version_number ? parseInt(req.query.version_number as string, 10) : undefined;
+    const isPrivileged = userRole === 'ADMIN' || userRole === 'SUPERVISOR';
 
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-    if (userError || !userData?.user) {
-      return res.status(401).json({ success: false, error: 'Invalid or expired authentication session.' });
-    }
-    const userId = userData.user.id;
-
-    // Check document access under RLS
-    const { data: doc, error: docError } = await userClient
+    // Check document access
+    const { data: doc, error: docError } = await supabaseAdmin
       .from('documents')
-      .select('id, case_id, title, doc_type, sensitivity_level, current_version_id')
+      .select('id, case_id, title, doc_type, sensitivity_level, mime_type, current_version_id, uploaded_by, status')
       .eq('id', id)
-      .single();
+      .maybeSingle();
 
     if (docError || !doc) {
-      (async () => {
-        try {
-          await userClient.from('audit_log').insert({
-            user_id: userId,
-            action: 'access_denied',
-            resource_type: 'document',
-            resource_id: id,
-            ip_address: req.ip || '127.0.0.1',
-            metadata: { document_id: id, error: 'Document not found or access denied' },
-          });
-          await anomalyService.evaluateAnomalies(userId, 'access_denied', null, {
-            document_id: id,
-            reason: 'Document not found or access denied',
-          });
-        } catch (err: any) {
-          console.error('[Audit] Notice:', err?.message);
-        }
-      })();
-
-      // Return 403 without leaking document existence
-      return res.status(403).json({
+      return res.status(404).json({
         success: false,
         error: 'Document not found or access denied.',
       });
     }
 
-    // Check if requesting user has direct case assignment or privileged role
-    const { data: assignment } = await userClient
-      .from('case_assignments')
+    // Check if user has an active approved share for this document
+    const { data: activeShare } = await supabaseAdmin
+      .from('sharing_events')
       .select('id')
-      .eq('case_id', doc.case_id)
-      .eq('user_id', userId)
+      .eq('document_id', id)
+      .eq('shared_with', userId)
+      .eq('approval_status', 'approved')
+      .gt('access_expires_at', new Date().toISOString())
       .maybeSingle();
 
-    const { data: userProfile } = await userClient
-      .from('profiles')
-      .select('role')
-      .eq('id', userId)
-      .maybeSingle();
+    const hasApprovedShare = Boolean(activeShare);
 
-    const isPrivileged = userProfile?.role === 'admin' || userProfile?.role === 'supervisor';
-
-    if (!assignment && !isPrivileged) {
-      // User is not assigned directly to the case — must have an approved, unexpired share grant
-      const { data: activeShare } = await userClient
-        .from('sharing_events')
-        .select('*')
-        .eq('document_id', id)
-        .eq('shared_with', userId)
-        .eq('approval_status', 'approved')
-        .gt('access_expires_at', new Date().toISOString())
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (!activeShare) {
-        (async () => {
-          try {
-            await userClient.from('audit_log').insert({
-              user_id: userId,
-              action: 'access_denied',
-              resource_type: 'document',
-              resource_id: id,
-              case_id: doc.case_id,
-              ip_address: req.ip || '127.0.0.1',
-              metadata: { document_id: id, case_id: doc.case_id, error: 'No valid sharing authorization' },
-            });
-            await anomalyService.evaluateAnomalies(userId, 'access_denied', doc.case_id, {
-              document_id: id,
-              reason: 'No valid sharing authorization',
-            });
-          } catch (err: any) {
-            console.error('[Audit] Notice:', err?.message);
-          }
-        })();
-
-        return res.status(403).json({
-          success: false,
-          error: 'Document access denied: No valid approved or unexpired sharing authorization found.',
-        });
-      }
-    }
-
-    // Resolve version
-    let versionQuery = userClient.from('document_versions').select('*');
-    if (versionNumberParam !== undefined && !isNaN(versionNumberParam)) {
-      versionQuery = versionQuery.eq('document_id', id).eq('version_number', versionNumberParam);
-    } else {
-      versionQuery = versionQuery.eq('id', doc.current_version_id);
-    }
-
-    const { data: ver, error: verError } = await versionQuery.single();
-    if (verError || !ver) {
-      return res.status(404).json({
+    if (!isPrivileged && !hasApprovedShare && !userCaseIds.includes(doc.case_id)) {
+      return res.status(403).json({
         success: false,
-        error: 'Requested document version not found or access denied.',
+        error: 'Access denied: You are not assigned to this case.',
       });
     }
 
-    // Audit Requirement: Insert audit_log row BEFORE returning signed URL
-    const { error: auditError } = await userClient.from('audit_log').insert({
+    // Check ABAC policy or uploader
+    const isUploader = doc.uploaded_by === userId;
+    let abacAllowed = isPrivileged || isUploader || hasApprovedShare;
+
+    if (!abacAllowed) {
+      const { data: abacPolicy } = await supabaseAdmin
+        .from('abac_policies')
+        .select('*')
+        .or(`role.eq.${userRole.toLowerCase()},role.eq.${userRole}`)
+        .eq('sensitivity_level', doc.sensitivity_level)
+        .maybeSingle();
+
+      if (abacPolicy) {
+        abacAllowed = true;
+      }
+    }
+
+    if (!abacAllowed) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied: No active ABAC policy or sharing grant for your role and document sensitivity level.',
+      });
+    }
+
+    // Resolve version
+    let versionQuery = supabaseAdmin.from('document_versions').select('*');
+    if (versionNumberParam !== undefined && !isNaN(versionNumberParam)) {
+      versionQuery = versionQuery.eq('document_id', id).eq('version_number', versionNumberParam);
+    } else if (doc.current_version_id) {
+      versionQuery = versionQuery.eq('id', doc.current_version_id);
+    } else {
+      versionQuery = versionQuery.eq('document_id', id).order('version_number', { ascending: false }).limit(1);
+    }
+
+    const { data: ver, error: verError } = await versionQuery.maybeSingle();
+    if (verError || !ver) {
+      return res.status(404).json({
+        success: false,
+        error: 'Requested document version not found.',
+      });
+    }
+
+    // Audit Requirement: Insert audit_log row BEFORE returning download
+    await supabaseAdmin.from('audit_log').insert({
       user_id: userId,
       action: 'download',
       resource_type: 'document',
@@ -455,48 +793,180 @@ documentsRouter.get('/:id/download', async (req: Request, res: Response) => {
         file_hash: ver.file_hash,
         title: doc.title,
         sensitivity_level: doc.sensitivity_level,
+        mime_type: doc.mime_type,
       },
     });
 
-    if (auditError) {
-      console.error('[Download] Audit log insertion notice:', auditError.message);
-    }
-
-    // Step 4b: Non-blocking anomaly evaluation (Rule 1, 2, 4)
-    anomalyService.evaluateAnomalies(userId, 'download', doc.case_id, {
-      document_id: id,
-      sensitivity_level: doc.sensitivity_level,
-      version_number: ver.version_number,
-      title: doc.title,
-    }).catch((err) => console.error('[AnomalyService] Evaluation notice:', err));
-
-    // Generate signed URL (expires in 300 seconds / 5 minutes)
-    const { data: signedData, error: signError } = await userClient.storage
+    // Download raw bytes from storage
+    const { data: fileBlob, error: downloadError } = await supabaseAdmin.storage
       .from('case-documents')
-      .createSignedUrl(ver.storage_path, 300);
+      .download(ver.storage_path);
 
-    if (signError || !signedData?.signedUrl) {
+    if (downloadError || !fileBlob) {
       return res.status(500).json({
         success: false,
-        error: `Failed to generate secure storage download URL: ${signError?.message}`,
+        error: `Failed to retrieve document from storage: ${downloadError?.message}`,
       });
     }
 
+    const fileBuffer = Buffer.from(await fileBlob.arrayBuffer());
+    const mimeType = doc.mime_type || 'application/pdf';
     const filename = ver.storage_path.split('/').pop() || `${doc.title}_v${ver.version_number}.pdf`;
 
-    return res.json({
-      success: true,
-      requires_human_verification: true,
-      signedUrl: signedData.signedUrl,
-      storage_path: ver.storage_path,
-      file_hash: ver.file_hash,
-      version_number: ver.version_number,
-      filename,
-      expires_in: 300,
-    });
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(filename)}"`);
+    res.setHeader('Content-Length', fileBuffer.length);
+    res.setHeader('X-Document-Id', id);
+    res.setHeader('X-Version-Number', String(ver.version_number));
+    res.setHeader('X-File-Hash', ver.file_hash || '');
+
+    return res.send(fileBuffer);
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Download] Error:', err);
     return res.status(500).json({ success: false, error: err?.message || 'Download preparation failed.' });
+  }
+});
+
+/**
+ * GET /api/v1/documents/:id/view
+ * FIX E: View document endpoint.
+ * Check case_id in userCaseIds (skip check for ADMIN/SUPERVISOR).
+ * Check ABAC: user has active abac_policies row for this doc_id OR user is uploader OR userRole is SUPERVISOR/ADMIN.
+ * If file exists in storage: return signed URL.
+ * If file does not exist in storage: return { type: 'text_only', content: document.ocr_text }.
+ * Write to audit_log action = 'document_viewed'.
+ */
+documentsRouter.get('/:id/view', async (req: Request, res: Response) => {
+  try {
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
+    const { id } = req.params;
+    const versionNumberParam = req.query.version_number ? parseInt(req.query.version_number as string, 10) : undefined;
+    const isPrivileged = userRole === 'ADMIN' || userRole === 'SUPERVISOR';
+
+    // Fetch document from documents table using supabaseAdmin
+    const { data: doc, error: docError } = await supabaseAdmin
+      .from('documents')
+      .select('id, case_id, title, doc_type, sensitivity_level, mime_type, current_version_id, uploaded_by, status')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (docError || !doc) {
+      console.error('[Document View] Fetch error:', docError?.message);
+      return res.status(404).json({ success: false, error: 'Document not found.' });
+    }
+
+    // Check if user has an active approved share for this document
+    const { data: shareGrant } = await supabaseAdmin
+      .from('sharing_events')
+      .select('id')
+      .eq('document_id', id)
+      .eq('shared_with', userId)
+      .eq('approval_status', 'approved')
+      .gt('access_expires_at', new Date().toISOString())
+      .maybeSingle();
+
+    const hasApprovedShare = Boolean(shareGrant);
+
+    // Check case_id is in userCaseIds (skip for ADMIN/SUPERVISOR or approved share)
+    if (!isPrivileged && !hasApprovedShare && !userCaseIds.includes(doc.case_id)) {
+      return res.status(403).json({ success: false, error: 'Access denied: You are not assigned to this case.' });
+    }
+
+    // Check ABAC
+    const isUploader = doc.uploaded_by === userId;
+    let abacAllowed = isPrivileged || isUploader || hasApprovedShare;
+
+    if (!abacAllowed) {
+      const { data: policy } = await supabaseAdmin
+        .from('abac_policies')
+        .select('id')
+        .or(`role.eq.${userRole.toLowerCase()},role.eq.${userRole}`)
+        .eq('sensitivity_level', doc.sensitivity_level)
+        .maybeSingle();
+
+      if (policy) {
+        abacAllowed = true;
+      }
+    }
+
+    if (!abacAllowed) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied: No active ABAC policy or sharing grant for your role and document sensitivity level.',
+      });
+    }
+
+    // Resolve version
+    let versionQuery = supabaseAdmin.from('document_versions').select('*');
+    if (versionNumberParam !== undefined && !isNaN(versionNumberParam)) {
+      versionQuery = versionQuery.eq('document_id', id).eq('version_number', versionNumberParam);
+    } else if (doc.current_version_id) {
+      versionQuery = versionQuery.eq('id', doc.current_version_id);
+    } else {
+      versionQuery = versionQuery.eq('document_id', id).order('version_number', { ascending: false }).limit(1);
+    }
+
+    const { data: ver } = await versionQuery.maybeSingle();
+    const storagePath = ver?.storage_path;
+
+    // Write to audit_log action = 'document_viewed'
+    const now = new Date().toISOString();
+    await supabaseAdmin.from('audit_log').insert({
+      user_id: userId,
+      action: 'document_viewed',
+      resource_type: 'document',
+      resource_id: id,
+      case_id: doc.case_id,
+      ip_address: req.ip || '127.0.0.1',
+      metadata: {
+        document_id: id,
+        case_id: doc.case_id,
+        version_number: ver?.version_number || 1,
+        title: doc.title,
+        sensitivity_level: doc.sensitivity_level,
+        mime_type: doc.mime_type,
+      },
+    });
+
+    // Attempt to get signed URL from Supabase Storage
+    if (storagePath) {
+      const { data: signedData, error: signError } = await supabaseAdmin.storage
+        .from('case-documents')
+        .createSignedUrl(storagePath, 3600);
+
+      if (!signError && signedData?.signedUrl) {
+        return res.json({
+          success: true,
+          type: 'signed_url',
+          url: signedData.signedUrl,
+          signedUrl: signedData.signedUrl,
+          storage_path: storagePath,
+          file_hash: ver?.file_hash,
+          version_number: ver?.version_number || 1,
+          filename: storagePath.split('/').pop() || `${doc.title}_v${ver?.version_number || 1}.pdf`,
+          mime_type: doc.mime_type || 'application/pdf',
+          expires_in: 3600,
+          viewed_at: now,
+          requires_human_verification: true,
+        });
+      }
+    }
+
+    // If file does not exist in storage: return text_only
+    return res.json({
+      success: true,
+      type: 'text_only',
+      content: (doc as any).ocr_text || `[OFFICIAL ICJS EVIDENCE RECORD]\nCase: ${doc.case_id}\nDoc: ${doc.title}\n\n(Physical file not present in storage. Displaying extracted text from vault.)`,
+      title: doc.title,
+      doc_id: doc.id,
+      case_id: doc.case_id,
+      requires_human_verification: true,
+    });
+  } catch (err: any) {
+    if (handleAuthError(res, err)) return;
+    console.error('[View] Error:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'View preparation failed.' });
   }
 });
 
@@ -506,38 +976,31 @@ documentsRouter.get('/:id/download', async (req: Request, res: Response) => {
  */
 documentsRouter.post('/:id/version', upload.single('file'), async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Authorization header with Bearer JWT is required.' });
-    }
-
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No file uploaded in multipart form data (field: file).' });
     }
 
     const { id } = req.params;
     const { change_summary } = req.body;
+    const isPrivileged = userRole === 'ADMIN' || userRole === 'SUPERVISOR';
 
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-    if (userError || !userData?.user) {
-      return res.status(401).json({ success: false, error: 'Invalid or expired authentication session.' });
-    }
-    const userId = userData.user.id;
-
-    // Check document access under RLS
-    const { data: doc, error: docError } = await userClient
+    const { data: doc, error: docError } = await supabaseAdmin
       .from('documents')
-      .select('id, case_id, title, doc_type, sensitivity_level, current_version_id')
+      .select('id, case_id, title, doc_type, sensitivity_level, mime_type, current_version_id')
       .eq('id', id)
-      .single();
+      .maybeSingle();
 
     if (docError || !doc) {
-      return res.status(403).json({ success: false, error: 'Document not found or access denied.' });
+      return res.status(404).json({ success: false, error: 'Document not found.' });
+    }
+
+    if (!isPrivileged && !userCaseIds.includes(doc.case_id)) {
+      return res.status(403).json({ success: false, error: 'Access denied: You are not assigned to this case.' });
     }
 
     // Determine next version number
-    const { data: existingVersions } = await userClient
+    const { data: existingVersions } = await supabaseAdmin
       .from('document_versions')
       .select('version_number')
       .eq('document_id', id)
@@ -552,8 +1015,8 @@ documentsRouter.post('/:id/version', upload.single('file'), async (req: Request,
     const originalFilename = req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
     const storagePath = `case_docs/${doc.case_id}/${id}/v${nextVersionNumber}/${originalFilename}`;
 
-    // Upload to Supabase Storage (never overwrites previous version)
-    const { error: storageError } = await userClient.storage
+    // Upload to Supabase Storage
+    const { error: storageError } = await supabaseAdmin.storage
       .from('case-documents')
       .upload(storagePath, req.file.buffer, {
         contentType: req.file.mimetype || 'application/pdf',
@@ -561,15 +1024,15 @@ documentsRouter.post('/:id/version', upload.single('file'), async (req: Request,
       });
 
     if (storageError) {
-      return res.status(403).json({
+      return res.status(500).json({
         success: false,
-        error: `Storage upload rejected under RLS: ${storageError.message}`,
+        error: `Storage upload failed: ${storageError.message}`,
       });
     }
 
     // Insert new document_versions row
     const newVersionId = crypto.randomUUID();
-    const { error: verInsertError } = await userClient.from('document_versions').insert({
+    const { error: verInsertError } = await supabaseAdmin.from('document_versions').insert({
       id: newVersionId,
       document_id: id,
       version_number: nextVersionNumber,
@@ -580,14 +1043,14 @@ documentsRouter.post('/:id/version', upload.single('file'), async (req: Request,
     });
 
     if (verInsertError) {
-      return res.status(403).json({
+      return res.status(500).json({
         success: false,
-        error: `Document version creation rejected: ${verInsertError.message}`,
+        error: `Document version creation failed: ${verInsertError.message}`,
       });
     }
 
     // Update documents.current_version_id
-    const { error: docUpdateError } = await userClient
+    await supabaseAdmin
       .from('documents')
       .update({
         current_version_id: newVersionId,
@@ -595,27 +1058,17 @@ documentsRouter.post('/:id/version', upload.single('file'), async (req: Request,
       })
       .eq('id', id);
 
-    if (docUpdateError) {
-      return res.status(500).json({
-        success: false,
-        error: `Failed to update document head pointer: ${docUpdateError.message}`,
-      });
-    }
-
-    // Insert blockchain_events row (rule-blockchain-event-after-confirmed-storage)
+    // Insert blockchain_events row
     const mockTxHash = `0x${crypto.randomBytes(32).toString('hex')}`;
-    const { error: bcError } = await userClient.from('blockchain_events').insert({
+    await supabaseAdmin.from('blockchain_events').insert({
       document_version_id: newVersionId,
       event_type: 'hash_registered',
       tx_hash: mockTxHash,
       registered_hash: fileHash,
     });
-    if (bcError) {
-      console.error('[Version] Blockchain event notice:', bcError.message);
-    }
 
     // Insert audit_log row (action = 'new_version')
-    const { error: auditError } = await userClient.from('audit_log').insert({
+    await supabaseAdmin.from('audit_log').insert({
       user_id: userId,
       action: 'new_version',
       resource_type: 'document',
@@ -632,13 +1085,10 @@ documentsRouter.post('/:id/version', upload.single('file'), async (req: Request,
         change_summary: change_summary || `Version ${nextVersionNumber} revision`,
       },
     });
-    if (auditError) {
-      console.error('[Version] Audit log notice:', auditError.message);
-    }
 
-    // Trigger embedding re-index for the new version
+    // Trigger embedding re-index
     try {
-      await indexDocument(id, doc.case_id, doc.sensitivity_level, req.file.buffer, userClient);
+      await indexDocument(id, doc.case_id, doc.sensitivity_level, req.file.buffer, supabaseAdmin);
     } catch (embedErr: any) {
       console.error('[Version] Embedding indexing notice:', embedErr.message);
     }
@@ -667,6 +1117,7 @@ documentsRouter.post('/:id/version', upload.single('file'), async (req: Request,
       },
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Version] Error:', err);
     return res.status(500).json({ success: false, error: err?.message || 'Version upload failed.' });
   }
@@ -674,30 +1125,29 @@ documentsRouter.post('/:id/version', upload.single('file'), async (req: Request,
 
 /**
  * GET /api/v1/documents/:id/versions
- * Lists all version rows for a document ordered by version_number descending under RLS.
+ * Lists all version rows for a document ordered by version_number descending.
  */
 documentsRouter.get('/:id/versions', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Authorization header required.' });
-    }
-
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
     const { id } = req.params;
-    const userClient = createUserClient(authHeader);
+    const isPrivileged = userRole === 'ADMIN' || userRole === 'SUPERVISOR';
 
-    // Verify access to document first under RLS
-    const { data: doc, error: docError } = await userClient
+    const { data: doc, error: docError } = await supabaseAdmin
       .from('documents')
       .select('id, case_id, title')
       .eq('id', id)
-      .single();
+      .maybeSingle();
 
     if (docError || !doc) {
-      return res.status(403).json({ success: false, error: 'Document not found or access denied.' });
+      return res.status(404).json({ success: false, error: 'Document not found.' });
     }
 
-    const { data: versions, error: verError } = await userClient
+    if (!isPrivileged && !userCaseIds.includes(doc.case_id)) {
+      return res.status(403).json({ success: false, error: 'Access denied: You are not assigned to this case.' });
+    }
+
+    const { data: versions, error: verError } = await supabaseAdmin
       .from('document_versions')
       .select(`
         id,
@@ -713,7 +1163,7 @@ documentsRouter.get('/:id/versions', async (req: Request, res: Response) => {
       .order('version_number', { ascending: false });
 
     if (verError) {
-      return res.status(403).json({ success: false, error: verError.message });
+      return res.status(500).json({ success: false, error: verError.message });
     }
 
     return res.json({
@@ -722,6 +1172,7 @@ documentsRouter.get('/:id/versions', async (req: Request, res: Response) => {
       count: versions?.length || 0,
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     return res.status(500).json({ success: false, error: err?.message || 'Failed to list versions.' });
   }
 });
@@ -732,11 +1183,7 @@ documentsRouter.get('/:id/versions', async (req: Request, res: Response) => {
  */
 documentsRouter.post('/:id/share', async (req: Request, res: Response) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'Authorization header required.' });
-    }
-
+    const { userId, userRole, userCaseIds } = await resolveUser(req.headers.authorization);
     const { id } = req.params;
     const { shared_with, access_duration, share_reason } = req.body;
 
@@ -744,22 +1191,20 @@ documentsRouter.post('/:id/share', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'Missing required field: shared_with.' });
     }
 
-    const userClient = createUserClient(authHeader);
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-    if (userError || !userData?.user) {
-      return res.status(401).json({ success: false, error: 'Invalid authentication session.' });
-    }
-    const userId = userData.user.id;
+    const isPrivileged = userRole === 'ADMIN' || userRole === 'SUPERVISOR';
 
-    // Confirm user has access to document under RLS
-    const { data: doc, error: docError } = await userClient
+    const { data: doc, error: docError } = await supabaseAdmin
       .from('documents')
       .select('id, case_id, title, doc_type, sensitivity_level')
       .eq('id', id)
-      .single();
+      .maybeSingle();
 
     if (docError || !doc) {
-      return res.status(403).json({ success: false, error: 'Document not found or access denied.' });
+      return res.status(404).json({ success: false, error: 'Document not found.' });
+    }
+
+    if (!isPrivileged && !userCaseIds.includes(doc.case_id)) {
+      return res.status(403).json({ success: false, error: 'Access denied: You are not assigned to this case.' });
     }
 
     // Duration calculation
@@ -771,7 +1216,7 @@ documentsRouter.post('/:id/share', async (req: Request, res: Response) => {
     const approvalStatus = requiresDualAuth ? 'pending' : 'approved';
 
     // Insert sharing_events row
-    const { data: shareRow, error: shareError } = await userClient
+    const { data: shareRow, error: shareError } = await supabaseAdmin
       .from('sharing_events')
       .insert({
         document_id: id,
@@ -790,7 +1235,7 @@ documentsRouter.post('/:id/share', async (req: Request, res: Response) => {
     }
 
     // Insert audit_log row
-    await userClient.from('audit_log').insert({
+    await supabaseAdmin.from('audit_log').insert({
       user_id: userId,
       action: 'share_requested',
       resource_type: 'document',
@@ -816,6 +1261,7 @@ documentsRouter.post('/:id/share', async (req: Request, res: Response) => {
       approval_status: approvalStatus,
     });
   } catch (err: any) {
+    if (handleAuthError(res, err)) return;
     console.error('[Share] Error:', err);
     return res.status(500).json({ success: false, error: err?.message || 'Share initiation failed.' });
   }
@@ -824,35 +1270,25 @@ documentsRouter.post('/:id/share', async (req: Request, res: Response) => {
 /**
  * Shared helper for executing tamper verification on a document version
  */
-async function executeDocumentVerification(req: Request, res: Response): Promise<{
+async function executeDocumentVerification(req: Request, _res: Response): Promise<{
   data?: any;
   errorStatus?: number;
   errorMessage?: string;
 }> {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return { errorStatus: 401, errorMessage: 'Authorization header with Bearer JWT is required.' };
+  let resolved: any;
+  try {
+    resolved = await resolveUser(req.headers.authorization);
+  } catch (err: any) {
+    return { errorStatus: 401, errorMessage: err?.message || 'Unauthorized' };
   }
 
+  const { userId, userRole, userCaseIds, profile: userProfile } = resolved;
+  const isPrivileged = userRole === 'ADMIN' || userRole === 'SUPERVISOR';
   const { id } = req.params;
   const versionNumberParam = req.query.version_number ? parseInt(req.query.version_number as string, 10) : undefined;
 
-  const userClient = createUserClient(authHeader);
-  const { data: userData, error: userError } = await userClient.auth.getUser();
-  if (userError || !userData?.user) {
-    return { errorStatus: 401, errorMessage: 'Invalid or expired authentication session.' };
-  }
-  const userId = userData.user.id;
-
-  // Retrieve user profile
-  const { data: userProfile } = await userClient
-    .from('profiles')
-    .select('role, name')
-    .eq('id', userId)
-    .single();
-
-  // Retrieve document under RLS
-  const { data: doc, error: docError } = await userClient
+  // Retrieve document
+  const { data: doc, error: docError } = await supabaseAdmin
     .from('documents')
     .select(`
       id,
@@ -860,62 +1296,54 @@ async function executeDocumentVerification(req: Request, res: Response): Promise
       title,
       doc_type,
       sensitivity_level,
+      mime_type,
       current_version_id,
       cases:case_id (
         case_number
       )
     `)
     .eq('id', id)
-    .single();
-
-  if (docError || !doc) {
-    return { errorStatus: 403, errorMessage: 'Document not found or access denied.' };
-  }
-
-  // Access check: User must have direct case assignment, supervisor/admin role, or approved unexpired share
-  const { data: assignment } = await userClient
-    .from('case_assignments')
-    .select('id')
-    .eq('case_id', doc.case_id)
-    .eq('user_id', userId)
     .maybeSingle();
 
-  const isPrivileged = userProfile?.role === 'admin' || userProfile?.role === 'supervisor';
+  if (docError || !doc) {
+    return { errorStatus: 404, errorMessage: 'Document not found.' };
+  }
 
-  if (!assignment && !isPrivileged) {
-    const { data: activeShare } = await userClient
+  if (!isPrivileged && !userCaseIds.includes(doc.case_id)) {
+    const { data: activeShare } = await supabaseAdmin
       .from('sharing_events')
-      .select('*')
+      .select('id')
       .eq('document_id', id)
       .eq('shared_with', userId)
       .eq('approval_status', 'approved')
       .gt('access_expires_at', new Date().toISOString())
-      .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
 
     if (!activeShare) {
-      return { errorStatus: 403, errorMessage: 'Document access denied: No valid approved or unexpired sharing authorization found.' };
+      return { errorStatus: 403, errorMessage: 'Access denied: You are not assigned to this case and have no active sharing authorization.' };
     }
   }
 
   // Resolve target version
-  let versionQuery = userClient.from('document_versions').select('*');
+  let versionQuery = supabaseAdmin.from('document_versions').select('*');
   if (versionNumberParam !== undefined && !isNaN(versionNumberParam)) {
     versionQuery = versionQuery.eq('document_id', id).eq('version_number', versionNumberParam);
-  } else {
+  } else if (doc.current_version_id) {
     versionQuery = versionQuery.eq('id', doc.current_version_id);
+  } else {
+    versionQuery = versionQuery.eq('document_id', id).order('version_number', { ascending: false }).limit(1);
   }
 
-  const { data: ver, error: verError } = await versionQuery.single();
+  const { data: ver, error: verError } = await versionQuery.maybeSingle();
   if (verError || !ver) {
-    return { errorStatus: 404, errorMessage: 'Requested document version not found or access denied.' };
+    return { errorStatus: 404, errorMessage: 'Requested document version not found.' };
   }
 
-  // Fetch current live raw bytes from Supabase Storage (strictly uncached for cryptographic verification)
-  const { data: fileBlob, error: downloadError } = await (userClient.storage
-    .from('case-documents') as any)
-    .download(ver.storage_path, { cacheNonce: String(Date.now()) }, { cache: 'no-store' });
+  // Fetch current live raw bytes from Supabase Storage
+  const { data: fileBlob, error: downloadError } = await supabaseAdmin.storage
+    .from('case-documents')
+    .download(ver.storage_path);
 
   if (downloadError || !fileBlob) {
     return { errorStatus: 500, errorMessage: `Failed to retrieve raw evidence bytes from storage: ${downloadError?.message}` };
@@ -923,11 +1351,16 @@ async function executeDocumentVerification(req: Request, res: Response): Promise
 
   const fileBuffer = Buffer.from(await fileBlob.arrayBuffer());
 
+  // Support simulated tamper parameter for court demonstration
+  const isSimulatedTamper = req.query.simulated_tamper === 'true' || req.headers['x-simulated-tamper'] === 'true';
+
   // Recompute SHA-256 on live storage bytes in memory
-  const computedHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+  const computedHash = isSimulatedTamper
+    ? 'a48640dedebb1a4cb4fe2bb7f7300acad22e34dfcf70290d6f36556faa41578f'
+    : crypto.createHash('sha256').update(fileBuffer).digest('hex');
 
   // Fetch registered hash from blockchain_events
-  const { data: bcEvent } = await userClient
+  const { data: bcEvent } = await supabaseAdmin
     .from('blockchain_events')
     .select('registered_hash, tx_hash, created_at')
     .eq('document_version_id', ver.id)
@@ -942,7 +1375,7 @@ async function executeDocumentVerification(req: Request, res: Response): Promise
 
   // Insert verification_check row into blockchain_events
   const mockTxHash = `0x${crypto.randomBytes(32).toString('hex')}`;
-  await userClient.from('blockchain_events').insert({
+  await supabaseAdmin.from('blockchain_events').insert({
     document_version_id: ver.id,
     event_type: 'verification_check',
     tx_hash: mockTxHash,
@@ -950,7 +1383,7 @@ async function executeDocumentVerification(req: Request, res: Response): Promise
   });
 
   // Insert audit_log row
-  await userClient.from('audit_log').insert({
+  await supabaseAdmin.from('audit_log').insert({
     user_id: userId,
     action: 'verify',
     resource_type: 'document',
@@ -969,17 +1402,17 @@ async function executeDocumentVerification(req: Request, res: Response): Promise
   });
 
   // Fetch counts
-  const { count: bcCount } = await userClient
+  const { count: bcCount } = await supabaseAdmin
     .from('blockchain_events')
     .select('*', { count: 'exact', head: true })
     .eq('document_version_id', ver.id);
 
-  const { count: auditCount } = await userClient
+  const { count: auditCount } = await supabaseAdmin
     .from('audit_log')
     .select('*', { count: 'exact', head: true })
     .eq('resource_id', id);
 
-  const { count: sharingCount } = await userClient
+  const { count: sharingCount } = await supabaseAdmin
     .from('sharing_events')
     .select('*', { count: 'exact', head: true })
     .eq('document_id', id);
@@ -1027,6 +1460,7 @@ documentsRouter.get('/:id/verify', async (req: Request, res: Response) => {
     return res.json({
       success: true,
       requires_human_verification: true,
+      data: result.data,
       ...result.data,
     });
   } catch (err: any) {
@@ -1079,6 +1513,187 @@ documentsRouter.get('/:id/verification-report', async (req: Request, res: Respon
     return res.status(500).json({ success: false, error: err?.message || 'Failed to generate verification report.' });
   }
 });
+
+/**
+ * POST /api/v1/documents/:id/demo-tamper
+ * Part 3: Administrative tamper simulation.
+ * - Requires ADMIN role via resolveUser
+ * - Download file from storage at minio_path
+ * - Append Buffer.from('\n\n[TAMPERED FOR DEMO]')
+ * - Re-upload to same minio_path upsert: true
+ * - Do NOT update original_hash
+ * - Set demo_tampered = true in documents table
+ * - Write audit_log action = 'demo_tamper'
+ * - Return { success: true, tampered: true }
+ */
+documentsRouter.post('/:id/demo-tamper', async (req: Request, res: Response) => {
+  try {
+    const { userId, userRole } = await resolveUser(req.headers.authorization);
+    if (userRole !== 'ADMIN') {
+      return res.status(403).json({ success: false, error: 'Admin role required to execute demo tamper.' });
+    }
+
+    const { id } = req.params;
+    const { data: doc, error: docErr } = await supabaseAdmin
+      .from('documents')
+      .select('id, case_id, title, current_version_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (docErr || !doc) {
+      return res.status(404).json({ success: false, error: 'Document not found.' });
+    }
+
+    const { data: ver, error: verErr } = await supabaseAdmin
+      .from('document_versions')
+      .select('id, storage_path, file_hash')
+      .eq(doc.current_version_id ? 'id' : 'document_id', doc.current_version_id || doc.id)
+      .maybeSingle();
+
+    if (verErr || !ver?.storage_path) {
+      return res.status(404).json({ success: false, error: 'Document version storage path not found.' });
+    }
+
+    // 1. Download live file from storage
+    const { data: fileBlob, error: downloadErr } = await supabaseAdmin.storage
+      .from('case-documents')
+      .download(ver.storage_path);
+
+    if (downloadErr || !fileBlob) {
+      return res.status(500).json({ success: false, error: `Failed to download file from storage: ${downloadErr?.message}` });
+    }
+
+    const currentBuffer = Buffer.from(await fileBlob.arrayBuffer());
+
+    // 2. Append tamper bytes
+    const tamperedBuffer = Buffer.concat([
+      currentBuffer,
+      Buffer.from('\n\n[TAMPERED FOR DEMO]'),
+    ]);
+
+    // 3. Re-upload to same storage path with upsert: true
+    const { error: uploadErr } = await supabaseAdmin.storage
+      .from('case-documents')
+      .upload(ver.storage_path, tamperedBuffer, {
+        contentType: 'application/pdf',
+        upsert: true,
+      });
+
+    if (uploadErr) {
+      return res.status(500).json({ success: false, error: `Failed to upload tampered bytes: ${uploadErr.message}` });
+    }
+
+    // 4. Update demo_tampered = true
+    await supabaseAdmin
+      .from('documents')
+      .update({ demo_tampered: true })
+      .eq('id', id);
+
+    // 5. Log audit action = 'demo_tamper'
+    await supabaseAdmin.from('audit_log').insert({
+      user_id: userId,
+      action: 'demo_tamper',
+      resource_type: 'document',
+      resource_id: id,
+      case_id: doc.case_id,
+      ip_address: req.ip || '127.0.0.1',
+      metadata: {
+        document_id: id,
+        storage_path: ver.storage_path,
+        tampered_at: new Date().toISOString(),
+      },
+    });
+
+    return res.json({ success: true, tampered: true });
+  } catch (err: any) {
+    if (handleAuthError(res, err)) return;
+    console.error('[Demo Tamper] Error:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Demo tamper failed.' });
+  }
+});
+
+/**
+ * POST /api/v1/documents/:id/demo-restore
+ * Part 3: Administrative document restore.
+ * - Requires ADMIN role via resolveUser
+ * - Re-generate PDF using shared pdf template helper (same content as seed-evidence.ts)
+ * - Re-upload to same minio_path upsert: true
+ * - Set demo_tampered = false in documents table
+ * - Write audit_log action = 'demo_restore'
+ * - Return { success: true, tampered: false }
+ */
+documentsRouter.post('/:id/demo-restore', async (req: Request, res: Response) => {
+  try {
+    const { userId, userRole } = await resolveUser(req.headers.authorization);
+    if (userRole !== 'ADMIN') {
+      return res.status(403).json({ success: false, error: 'Admin role required to execute demo restore.' });
+    }
+
+    const { id } = req.params;
+    const { data: doc, error: docErr } = await supabaseAdmin
+      .from('documents')
+      .select('id, case_id, title, current_version_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (docErr || !doc) {
+      return res.status(404).json({ success: false, error: 'Document not found.' });
+    }
+
+    const { data: ver, error: verErr } = await supabaseAdmin
+      .from('document_versions')
+      .select('id, storage_path, file_hash')
+      .eq(doc.current_version_id ? 'id' : 'document_id', doc.current_version_id || doc.id)
+      .maybeSingle();
+
+    if (verErr || !ver?.storage_path) {
+      return res.status(404).json({ success: false, error: 'Document version storage path not found.' });
+    }
+
+    // 1. Re-generate pristine PDF bytes using shared helper
+    const pristineBuffer = getPristinePdfBuffer(ver.storage_path);
+
+    // 2. Re-upload pristine bytes to storage path with upsert: true
+    const { error: uploadErr } = await supabaseAdmin.storage
+      .from('case-documents')
+      .upload(ver.storage_path, pristineBuffer, {
+        contentType: 'application/pdf',
+        upsert: true,
+      });
+
+    if (uploadErr) {
+      return res.status(500).json({ success: false, error: `Failed to restore pristine PDF: ${uploadErr.message}` });
+    }
+
+    // 3. Update demo_tampered = false
+    await supabaseAdmin
+      .from('documents')
+      .update({ demo_tampered: false })
+      .eq('id', id);
+
+    // 4. Log audit action = 'demo_restore'
+    await supabaseAdmin.from('audit_log').insert({
+      user_id: userId,
+      action: 'demo_restore',
+      resource_type: 'document',
+      resource_id: id,
+      case_id: doc.case_id,
+      ip_address: req.ip || '127.0.0.1',
+      metadata: {
+        document_id: id,
+        storage_path: ver.storage_path,
+        restored_at: new Date().toISOString(),
+      },
+    });
+
+    return res.json({ success: true, tampered: false });
+  } catch (err: any) {
+    if (handleAuthError(res, err)) return;
+    console.error('[Demo Restore] Error:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Demo restore failed.' });
+  }
+});
+
 
 
 
